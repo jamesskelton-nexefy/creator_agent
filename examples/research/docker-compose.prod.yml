@@ -1,0 +1,81 @@
+# LangGraph Standalone Server Deployment
+# Works with any CI/CD (Bitbucket, GitLab, etc.) - no GitHub required
+#
+# Usage:
+# 1. Build image: npx @langchain/langgraph-cli build -t node-expert-agent:latest
+# 2. Set environment variables in .env.prod
+# 3. Run: docker-compose -f docker-compose.prod.yml up -d
+
+volumes:
+  langgraph-data:
+    driver: local
+  redis-data:
+    driver: local
+
+services:
+  # Redis for pub-sub streaming
+  langgraph-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: redis-cli ping
+      interval: 5s
+      timeout: 1s
+      retries: 5
+
+  # PostgreSQL for persistence (threads, checkpoints, assistants)
+  langgraph-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5433:5432"  # Different port to avoid conflict with local Supabase
+    environment:
+      POSTGRES_DB: langgraph
+      POSTGRES_USER: langgraph
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langgraph_secure_password}
+    volumes:
+      - langgraph-data:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -U langgraph -d langgraph
+      start_period: 10s
+      timeout: 1s
+      retries: 5
+      interval: 5s
+
+  # LangGraph Agent Server
+  langgraph-api:
+    image: ${IMAGE_NAME:-node-expert-agent:latest}
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      langgraph-redis:
+        condition: service_healthy
+      langgraph-postgres:
+        condition: service_healthy
+    environment:
+      # Database connections (auto-configured, no checkpointer needed in code)
+      REDIS_URI: redis://langgraph-redis:6379
+      DATABASE_URI: postgres://langgraph:${POSTGRES_PASSWORD:-langgraph_secure_password}@langgraph-postgres:5432/langgraph?sslmode=disable
+      
+      # LangSmith for observability (optional but recommended)
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-true}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-node-expert-production}
+      
+      # Your agent's API keys
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      TAVILY_API_KEY: ${TAVILY_API_KEY}
+      COPILOT_CLOUD_PUBLIC_API_KEY: ${COPILOT_CLOUD_PUBLIC_API_KEY}
+      
+      # License key (required for production)
+      LANGGRAPH_CLOUD_LICENSE_KEY: ${LANGGRAPH_CLOUD_LICENSE_KEY}
+    healthcheck:
+      test: curl -f http://localhost:8000/ok || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+

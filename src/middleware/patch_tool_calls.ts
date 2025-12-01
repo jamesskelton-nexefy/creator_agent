@@ -4,7 +4,7 @@ import {
   ToolMessage,
   AIMessage,
 } from "langchain";
-import { RemoveMessage } from "@langchain/core/messages";
+import { RemoveMessage, type BaseMessage } from "@langchain/core/messages";
 import { REMOVE_ALL_MESSAGES } from "@langchain/langgraph";
 
 /**
@@ -51,7 +51,7 @@ export function createPatchToolCallsMiddleware(): AgentMiddleware {
             const correspondingToolMsg = messages
               .slice(i)
               .find(
-                (m) =>
+                (m: BaseMessage) =>
                   ToolMessage.isInstance(m) && m.tool_call_id === toolCall.id,
               );
 

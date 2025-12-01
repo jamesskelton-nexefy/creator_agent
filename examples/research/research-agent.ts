@@ -4,7 +4,11 @@ import { tool } from "langchain";
 import { TavilySearch } from "@langchain/tavily";
 import { ChatAnthropic } from "@langchain/anthropic";
 
-import { createDeepAgent, type SubAgent } from "../../src/index.js";
+import {
+  createDeepAgent,
+  createCopilotKitMiddleware,
+  type SubAgent,
+} from "../../src/index.js";
 
 type Topic = "general" | "news" | "finance";
 
@@ -106,10 +110,68 @@ const critiqueSubAgent: SubAgent = {
   systemPrompt: subCritiquePrompt,
 };
 
-// Prompt prefix to steer the agent to be an expert researcher
-const researchInstructions = `You are an expert researcher. Your job is to conduct thorough research, and then write a polished report.
+// Node management subagent system prompt - now focuses on planning/designing node structures
+const nodeAgentPrompt = `You are a content structure specialist for BlueprintCMS. Your role is to help users PLAN and DESIGN content node structures.
 
-The first thing you should do is to write the original user question to \`question.txt\` so you have a record of it.
+## Your Role
+
+You help users think through and design content hierarchies. You do NOT have access to frontend tools.
+Instead, you output structured JSON that the frontend will use to create nodes.
+
+## Hierarchy Understanding
+
+Each project has hierarchy levels (typically 2-6):
+- **Level 1** is the project root (auto-created, never create manually)
+- **Level 2** is where user content starts (called "Section", "Module", or "Chapter" depending on project)
+- **Levels 3-6** are for progressively more detailed content
+
+**Coding Types:**
+- \`numeric\`: 1, 2, 3... 
+- \`alpha\`: A, B, C...
+- \`title\`: Uses node title
+
+## How to Design Node Structures
+
+When asked to create nodes or design content structures:
+
+1. **Research the topic** if needed (use internet_search)
+2. **Plan the hierarchy** - think about modules, lessons, topics
+3. **Output structured JSON** in this format:
+
+\`\`\`json
+{
+  "plannedNodes": [
+    { "id": "1", "title": "Module Name", "type": "module", "content": "Description..." },
+    { "id": "2", "title": "Lesson Name", "type": "lesson", "parentId": "1", "content": "..." },
+    { "id": "3", "title": "Topic Name", "type": "topic", "parentId": "2", "content": "..." }
+  ]
+}
+\`\`\`
+
+The frontend will automatically create these nodes when it parses your response.
+
+## Key Rules
+
+1. **NEVER reference frontend tools** - you don't have access to them
+2. **Always output plannedNodes JSON** for node creation requests
+3. **Use parentId** to establish hierarchy relationships
+4. **Start at level 2** - never try to create level 1 (project root)
+5. **Be thorough** - include content descriptions for each node
+`;
+
+const nodeSubAgent: SubAgent = {
+  name: "node-agent",
+  description:
+    "Specialized agent for designing and planning content node structures. Use this to think through how to organize content into modules, lessons, and topics. This agent outputs structured JSON that the frontend uses to create nodes.",
+  systemPrompt: nodeAgentPrompt,
+};
+
+// Prompt prefix to steer the agent to be an expert researcher
+const researchInstructions = `You are an expert researcher and helpful assistant. Your primary job is to conduct thorough research and write polished reports. You can also help users design content structures.
+
+## Research Tasks
+
+For research tasks, the first thing you should do is to write the original user question to \`question.txt\` so you have a record of it.
 
 Use the research-agent to conduct deep research. It will respond to your questions/topics with a detailed answer.
 
@@ -194,9 +256,44 @@ You have access to a few tools.
 ## \`internet_search\`
 
 Use this to run an internet search for a given query. You can specify the number of results, the topic, and whether raw content should be included.
+
+## When to Use Which Tools
+
+- **User asks a research question or wants external information** → Use internet_search or delegate to research-agent subagent
+- **User wants to critique a report** → Use the critique-agent subagent
+- **User asks to create nodes, content structures, or project hierarchies** → Research and plan, then output structured JSON (see below)
+
+## Creating Nodes and Content Structures
+
+When asked to create nodes, design course structures, or build content hierarchies:
+1. Research the topic thoroughly using internet_search if needed
+2. Plan the structure carefully (modules, lessons, topics, etc.)
+3. Output your planned nodes as structured JSON in your response
+
+**IMPORTANT**: Do NOT call frontend tools directly. Instead, include your node plan in this format:
+
+\`\`\`json
+{
+  "plannedNodes": [
+    { "id": "1", "title": "Module Name", "type": "module", "content": "Description of this module..." },
+    { "id": "2", "title": "Lesson Name", "type": "lesson", "parentId": "1", "content": "Lesson content..." },
+    { "id": "3", "title": "Topic Name", "type": "topic", "parentId": "2", "content": "Topic details..." }
+  ]
+}
+\`\`\`
+
+Use hierarchical IDs and parentId to establish the structure. The frontend will parse this JSON and create the nodes automatically.
+
+## Available Subagents
+
+- **research-agent**: For in-depth research on topics. Give one topic at a time.
+- **critique-agent**: For reviewing and critiquing reports in final_report.md.
+- **node-agent**: For understanding hierarchy structures and node templates.
+
+Always respond helpfully with well-researched, structured content.
 `;
 
-// Create the agent
+// Create the agent with CopilotKit middleware for frontend tool support
 export const agent = createDeepAgent({
   model: new ChatAnthropic({
     model: "claude-sonnet-4-20250514",
@@ -205,30 +302,40 @@ export const agent = createDeepAgent({
 
   tools: [internetSearch],
   systemPrompt: researchInstructions,
-  subagents: [critiqueSubAgent, researchSubAgent],
+  subagents: [critiqueSubAgent, researchSubAgent, nodeSubAgent],
+
+  // Add CopilotKit middleware for context injection and shared state
+  // Frontend tools are handled via shared state pattern (see docs: https://docs.copilotkit.ai/langgraph/shared-state)
+  middleware: [
+    createCopilotKitMiddleware({
+      includeContextInPrompt: true,
+    }),
+  ],
 });
 
-// // Invoke the agent
-// async function main() {
-//   const result = await agent.invoke(
-//     {
-//       messages: [new HumanMessage("what is langgraph?")],
-//     },
-//     { recursionLimit: 1000 }
-//   );
+// Invoke the agent with recursion limit
+import { HumanMessage } from "@langchain/core/messages";
 
-//   console.log("🎉 Finished!");
-//   console.log(
-//     `\n\nAgent ToDo List:\n${result.todos.map((todo) => ` - ${todo.content} (${todo.status})`).join("\n")}`
-//   );
-//   console.log(
-//     `\n\nAgent Files:\n${Object.entries(result.files)
-//       .map(([key, value]) => ` - ${key}: ${value}`)
-//       .join("\n")}`
-//   );
-// }
+async function main() {
+  const result = await agent.invoke(
+    {
+      messages: [new HumanMessage("what is langgraph?")],
+    },
+    { recursionLimit: 100 } // Set recursion limit (default is 25)
+  );
 
-// // Run if this file is executed directly
-// if (import.meta.url === `file://${process.argv[1]}`) {
-//   main();
-// }
+  console.log("Finished!");
+  console.log(
+    `\n\nAgent ToDo List:\n${result.todos.map((todo: { content: string; status: string }) => ` - ${todo.content} (${todo.status})`).join("\n")}`
+  );
+  console.log(
+    `\n\nAgent Files:\n${Object.entries(result.files)
+      .map(([key, value]) => ` - ${key}: ${value}`)
+      .join("\n")}`
+  );
+}
+
+// Run if this file is executed directly
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}

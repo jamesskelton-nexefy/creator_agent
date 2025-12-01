@@ -9,3 +9,9 @@ export {
   type SubAgent,
 } from "./subagents.js";
 export { createPatchToolCallsMiddleware } from "./patch_tool_calls.js";
+export {
+  createCopilotKitMiddleware,
+  type CopilotKitMiddlewareOptions,
+  type CopilotKitState,
+  type PlannedNode,
+} from "./copilotkit.js";

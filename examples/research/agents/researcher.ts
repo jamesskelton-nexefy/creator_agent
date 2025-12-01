@@ -1,0 +1,500 @@
+/**
+ * Researcher Agent
+ *
+ * Deep knowledge gathering on industry, topics, regulations, and personas.
+ * Uses web search and document RAG tools to build comprehensive research briefs.
+ *
+ * Tools (Backend only - no frontend access):
+ * - web_search - Perplexity API search
+ * - listDocuments, searchDocuments, searchDocumentsByText, getDocumentLines, getDocumentByName
+ *
+ * Input: Reads projectBrief from state
+ * Output: researchFindings in shared state
+ */
+
+import { RunnableConfig } from "@langchain/core/runnables";
+import { AIMessage, SystemMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { ChatAnthropic } from "@langchain/anthropic";
+import { z } from "zod";
+import OpenAI from "openai";
+import { createDocumentService, DocumentService } from "../../../src/documents/index";
+import type { OrchestratorState, ResearchBrief } from "../state/agent-state";
+import { getCondensedBrief } from "../state/agent-state";
+
+// ============================================================================
+// MODEL CONFIGURATION
+// ============================================================================
+
+const researcherModel = new ChatAnthropic({
+  model: "claude-sonnet-4-20250514",
+  maxTokens: 16000,
+  temperature: 0.3, // Lower temperature for factual research
+});
+
+// ============================================================================
+// PERPLEXITY WEB SEARCH TOOL
+// ============================================================================
+
+const perplexityClient = new OpenAI({
+  apiKey: process.env.PERPLEXITY_API_KEY,
+  baseURL: "https://api.perplexity.ai",
+});
+
+const webSearch = tool(
+  async ({ query }: { query: string }) => {
+    console.log(`  [researcher/web_search] Searching: "${query}"`);
+
+    try {
+      const response = await perplexityClient.chat.completions.create({
+        model: "sonar-pro",
+        messages: [{ role: "user", content: query }],
+      });
+
+      const content = response.choices[0]?.message?.content || "No results found.";
+      const citations = (response as any).citations || [];
+
+      console.log(`  [researcher/web_search] Got ${citations.length} citations`);
+
+      return JSON.stringify({
+        answer: content,
+        citations: citations,
+        query: query,
+      });
+    } catch (error) {
+      console.error(`  [researcher/web_search] Error:`, error);
+      return JSON.stringify({
+        error: `Web search failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        query: query,
+      });
+    }
+  },
+  {
+    name: "web_search",
+    description:
+      "Search the web for current information using Perplexity AI. Use for researching industry topics, regulations, best practices, and current trends.",
+    schema: z.object({
+      query: z.string().describe("The search query to look up"),
+    }),
+  }
+);
+
+// ============================================================================
+// DOCUMENT RAG TOOLS
+// ============================================================================
+
+let documentService: DocumentService | null = null;
+
+function getDocumentService(): DocumentService {
+  if (!documentService) {
+    documentService = createDocumentService();
+  }
+  return documentService;
+}
+
+const listDocuments = tool(
+  async ({ category, limit }: { category?: string; limit?: number }) => {
+    console.log(`  [researcher/listDocuments] Listing - category: ${category || "all"}`);
+
+    try {
+      const docs = await getDocumentService().listDocuments({
+        category: category as "course_content" | "framework_content" | undefined,
+        limit: limit || 20,
+      });
+
+      console.log(`  [researcher/listDocuments] Found ${docs.length} documents`);
+
+      return JSON.stringify({
+        success: true,
+        count: docs.length,
+        documents: docs.map((d) => ({
+          id: d.id,
+          title: d.title,
+          category: d.category,
+          fileType: d.fileType,
+          totalLines: d.totalLines,
+        })),
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        error: `Failed to list documents: ${error instanceof Error ? error.message : "Unknown error"}`,
+      });
+    }
+  },
+  {
+    name: "listDocuments",
+    description: "List available uploaded documents. Use first to see what's available before searching.",
+    schema: z.object({
+      category: z.enum(["course_content", "framework_content"]).optional(),
+      limit: z.number().optional().describe("Max documents to return (default: 20)"),
+    }),
+  }
+);
+
+const searchDocuments = tool(
+  async ({ query, category, limit, threshold }: { query: string; category?: string; limit?: number; threshold?: number }) => {
+    console.log(`  [researcher/searchDocuments] Semantic search: "${query}"`);
+
+    try {
+      const results = await getDocumentService().searchDocuments({
+        query,
+        category: category as "course_content" | "framework_content" | undefined,
+        limit: limit || 5,
+        threshold: threshold || 0.7,
+      });
+
+      console.log(`  [researcher/searchDocuments] Found ${results.length} chunks`);
+
+      return JSON.stringify({
+        success: true,
+        count: results.length,
+        results: results.map((r) => ({
+          documentId: r.documentId,
+          documentTitle: r.documentTitle,
+          category: r.category,
+          content: r.content,
+          chunkIndex: r.chunkIndex,
+          startLine: r.startLine,
+          endLine: r.endLine,
+          similarity: r.similarity.toFixed(3),
+        })),
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        error: `Semantic search failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+      });
+    }
+  },
+  {
+    name: "searchDocuments",
+    description: "Semantic search across documents using AI embeddings. Best for conceptual queries.",
+    schema: z.object({
+      query: z.string().describe("What you're looking for conceptually"),
+      category: z.enum(["course_content", "framework_content"]).optional(),
+      limit: z.number().optional().describe("Max results (default: 5)"),
+      threshold: z.number().optional().describe("Min similarity 0-1 (default: 0.7)"),
+    }),
+  }
+);
+
+const searchDocumentsByText = tool(
+  async ({ searchText, category, limit }: { searchText: string; category?: string; limit?: number }) => {
+    console.log(`  [researcher/searchDocumentsByText] Text search: "${searchText}"`);
+
+    try {
+      const results = await getDocumentService().searchDocumentsByText({
+        searchText,
+        category: category as "course_content" | "framework_content" | undefined,
+        limit: limit || 10,
+      });
+
+      console.log(`  [researcher/searchDocumentsByText] Found ${results.length} chunks`);
+
+      return JSON.stringify({
+        success: true,
+        count: results.length,
+        results: results.map((r) => ({
+          documentId: r.documentId,
+          documentTitle: r.documentTitle,
+          content: r.content,
+          startLine: r.startLine,
+          endLine: r.endLine,
+          rank: r.rank.toFixed(3),
+        })),
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        error: `Text search failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+      });
+    }
+  },
+  {
+    name: "searchDocumentsByText",
+    description: "Full-text search for exact terms, definitions, or specific phrases.",
+    schema: z.object({
+      searchText: z.string().describe("Exact text or terms to search for"),
+      category: z.enum(["course_content", "framework_content"]).optional(),
+      limit: z.number().optional().describe("Max results (default: 10)"),
+    }),
+  }
+);
+
+const getDocumentLines = tool(
+  async ({ documentId, documentName, startLine, numLines }: { documentId?: string; documentName?: string; startLine: number; numLines: number }) => {
+    console.log(`  [researcher/getDocumentLines] Getting lines ${startLine}-${startLine + numLines - 1}`);
+
+    try {
+      let docId = documentId;
+
+      if (!docId && documentName) {
+        const doc = await getDocumentService().getDocumentByName(documentName);
+        if (!doc) {
+          return JSON.stringify({ success: false, error: `Document not found: ${documentName}` });
+        }
+        docId = doc.id;
+      }
+
+      if (!docId) {
+        return JSON.stringify({ success: false, error: "Either documentId or documentName required" });
+      }
+
+      const results = await getDocumentService().getDocumentLines({
+        documentId: docId,
+        startLine,
+        numLines,
+      });
+
+      const content = results.map((r) => r.content).join("\n");
+
+      return JSON.stringify({
+        success: true,
+        documentId: docId,
+        startLine,
+        numLines,
+        content,
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        error: `Failed to get lines: ${error instanceof Error ? error.message : "Unknown error"}`,
+      });
+    }
+  },
+  {
+    name: "getDocumentLines",
+    description: "Retrieve specific lines from a document. Use after search to get more context.",
+    schema: z.object({
+      documentId: z.string().optional(),
+      documentName: z.string().optional(),
+      startLine: z.number().describe("Line number to start from"),
+      numLines: z.number().describe("Number of lines to retrieve"),
+    }),
+  }
+);
+
+const getDocumentByName = tool(
+  async ({ documentName, section }: { documentName: string; section?: string }) => {
+    console.log(`  [researcher/getDocumentByName] Getting: "${documentName}"`);
+
+    try {
+      const doc = await getDocumentService().getDocumentByName(documentName);
+
+      if (!doc) {
+        return JSON.stringify({ success: false, error: `Document not found: ${documentName}` });
+      }
+
+      const content = await getDocumentService().getDocumentContent(doc.id);
+
+      let resultContent = content;
+      if (section) {
+        const sectionRegex = new RegExp(`(?:^|\\n)(#{1,3}\\s*${section}[^\\n]*)([\\s\\S]*?)(?=\\n#{1,3}\\s|$)`, "i");
+        const match = content.match(sectionRegex);
+        if (match) {
+          resultContent = match[1] + match[2];
+        }
+      }
+
+      const isLarge = resultContent.length > 10000;
+
+      return JSON.stringify({
+        success: true,
+        document: { id: doc.id, title: doc.title, category: doc.category },
+        contentLength: resultContent.length,
+        warning: isLarge ? "Large document - consider using search tools" : undefined,
+        content: isLarge ? resultContent.substring(0, 10000) + "\n\n[TRUNCATED]" : resultContent,
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        error: `Failed to get document: ${error instanceof Error ? error.message : "Unknown error"}`,
+      });
+    }
+  },
+  {
+    name: "getDocumentByName",
+    description: "Get full document content by name. WARNING: Only use for small documents.",
+    schema: z.object({
+      documentName: z.string().describe("Document title or filename"),
+      section: z.string().optional().describe("Specific section heading to extract"),
+    }),
+  }
+);
+
+/** All backend tools for the researcher */
+export const researcherTools = [
+  webSearch,
+  listDocuments,
+  searchDocuments,
+  searchDocumentsByText,
+  getDocumentLines,
+  getDocumentByName,
+];
+
+// ============================================================================
+// SYSTEM PROMPT
+// ============================================================================
+
+const RESEARCHER_SYSTEM_PROMPT = `You are The Researcher - a specialized agent focused on deep knowledge gathering for online training projects.
+
+## Your Role
+
+You conduct thorough research to provide comprehensive information that will inform course structure and content. Your research covers:
+
+1. **Industry Context** - Current state, trends, challenges in the target industry
+2. **Key Topics** - Core concepts, skills, and knowledge areas to cover
+3. **Regulations & Compliance** - Relevant laws, standards, certifications
+4. **Learner Personas** - Insights about the target audience's needs and challenges
+5. **Best Practices** - Industry-standard approaches and methodologies
+
+## Your Tools
+
+You have backend research tools only (no frontend interaction):
+
+### Web Search
+- **web_search** - Search the web via Perplexity AI for current information, trends, regulations
+
+### Document RAG
+- **listDocuments** - See available uploaded documents
+- **searchDocuments** - Semantic/conceptual search across documents
+- **searchDocumentsByText** - Exact term/phrase search
+- **getDocumentLines** - Get specific line ranges from documents
+- **getDocumentByName** - Get full document (use sparingly for small docs)
+
+## Research Strategy
+
+1. **Start Broad** - Use web_search for industry overview and current context
+2. **Check Internal Docs** - Use listDocuments to see what's already available
+3. **Deep Dive Topics** - Research each key topic area identified in the brief
+4. **Verify Regulations** - Specifically search for compliance requirements
+5. **Gather Evidence** - Collect citations for all key claims
+
+## Output Format
+
+Structure your findings as a research brief:
+
+\`\`\`json
+{
+  "industryContext": "Overview of the industry...",
+  "keyTopics": [
+    { "topic": "Topic Name", "summary": "...", "importance": "critical|important|supplementary" }
+  ],
+  "regulations": [
+    { "name": "Regulation Name", "summary": "...", "relevance": "..." }
+  ],
+  "personaInsights": "What we know about the learners...",
+  "bestPractices": ["Practice 1", "Practice 2"],
+  "citations": [
+    { "title": "Source Title", "url": "...", "summary": "Key point from this source" }
+  ]
+}
+\`\`\`
+
+## Guidelines
+
+- Be thorough but focused - research what's relevant to the project brief
+- Always cite sources for factual claims
+- Distinguish between critical, important, and supplementary topics
+- Note any gaps in available information
+- Prioritize recent/current information over dated sources
+- Check both web sources and internal documents
+- Keep context size manageable - summarize rather than dump raw content
+
+Remember: Quality research leads to impactful training. Take time to understand the domain deeply.`;
+
+// ============================================================================
+// RESEARCHER NODE FUNCTION
+// ============================================================================
+
+/**
+ * The Researcher agent node.
+ * Conducts deep research using web search and document RAG.
+ */
+export async function researcherNode(
+  state: OrchestratorState,
+  config: RunnableConfig
+): Promise<Partial<OrchestratorState>> {
+  console.log("\n[researcher] ============ Researcher Agent ============");
+  console.log("  Project brief available:", state.projectBrief ? "yes" : "no");
+
+  // Build context-aware system message
+  let systemContent = RESEARCHER_SYSTEM_PROMPT;
+
+  // Include project brief if available
+  if (state.projectBrief) {
+    const condensedBrief = getCondensedBrief(state.projectBrief);
+    systemContent += `\n\n## Project Brief to Research\n\n${condensedBrief}`;
+  }
+
+  // Include existing research if partial
+  if (state.researchFindings) {
+    systemContent += `\n\n## Existing Research (to extend)\n
+Topics already researched: ${state.researchFindings.keyTopics.length}
+Citations gathered: ${state.researchFindings.citations.length}
+
+Continue researching to fill any gaps or go deeper on key topics.`;
+  }
+
+  const systemMessage = new SystemMessage({ content: systemContent });
+
+  // Bind backend research tools
+  const modelWithTools = researcherModel.bindTools(researcherTools);
+
+  // Filter messages for this agent's context
+  const recentMessages = (state.messages || []).slice(-15);
+
+  console.log("  Invoking researcher model with", researcherTools.length, "tools...");
+
+  const response = await modelWithTools.invoke(
+    [systemMessage, ...recentMessages],
+    config
+  );
+
+  console.log("  Researcher response received");
+
+  const aiResponse = response as AIMessage;
+  if (aiResponse.tool_calls?.length) {
+    console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+  }
+
+  return {
+    messages: [response],
+    currentAgent: "researcher",
+    agentHistory: ["researcher"],
+  };
+}
+
+/**
+ * Parses a researcher's text response to extract research findings.
+ */
+export function parseResearchFindings(content: string): ResearchBrief | null {
+  try {
+    // Look for JSON block
+    const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[1]);
+      return validateResearchBrief(parsed);
+    }
+    return null;
+  } catch (error) {
+    console.error("[researcher] Failed to parse research findings:", error);
+    return null;
+  }
+}
+
+function validateResearchBrief(input: Partial<ResearchBrief>): ResearchBrief {
+  return {
+    industryContext: input.industryContext || "",
+    keyTopics: input.keyTopics || [],
+    regulations: input.regulations || [],
+    personaInsights: input.personaInsights || "",
+    bestPractices: input.bestPractices || [],
+    citations: input.citations || [],
+    rawNotes: input.rawNotes,
+  };
+}
+
+export default researcherNode;
+

@@ -12,8 +12,12 @@ export {
   createFilesystemMiddleware,
   createSubAgentMiddleware,
   createPatchToolCallsMiddleware,
+  createCopilotKitMiddleware,
   type FilesystemMiddlewareOptions,
   type SubAgentMiddlewareOptions,
+  type CopilotKitMiddlewareOptions,
+  type CopilotKitState,
+  type PlannedNode,
   type SubAgent,
   type FileData,
 } from "./middleware/index.js";
@@ -31,3 +35,21 @@ export {
   type WriteResult,
   type EditResult,
 } from "./backends/index.js";
+
+// Export documents module
+export {
+  DocumentService,
+  createDocumentService,
+  VectorStore,
+  createVectorStore,
+  processDocument,
+  getFileTypeFromMime,
+  isValidDocumentType,
+  type DocumentMetadata,
+  type ProcessedChunk,
+  type ProcessedDocument,
+  type SearchResult,
+  type TextSearchResult,
+  type UploadDocumentParams,
+  type UploadDocumentResult,
+} from "./documents/index.js";

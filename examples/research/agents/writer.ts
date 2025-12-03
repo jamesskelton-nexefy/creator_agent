@@ -1,71 +1,103 @@
 /**
  * Writer Agent
  *
- * Creates Level 6 content nodes with industry-appropriate training content.
- * Considers industry, learner persona, and purpose to write perfect training content.
+ * Creates the ACTUAL CONTENT for training courses (Level 6 content blocks).
+ * Works within the structure built by the Architect.
+ * Writes engaging, educational training material based on research and design guidelines.
  *
- * Tools (Full CRUD):
+ * Tools (Full CRUD + Navigation + Media):
  * - requestEditMode, releaseEditMode - Edit lock management
- * - createNode, getNodeTemplateFields, updateNodeFields, getNodeFields - Node CRUD
+ * - createNode, getNodeTemplateFields, updateNodeFields, getNodeFields - Content CRUD
+ * - getProjectHierarchyInfo, getAvailableTemplates, getNodesByLevel, getNodeDetails - Navigation
+ * - searchMicroverse, attachMicroverseToNode - Media integration
  *
  * Input: Reads courseStructure, researchFindings, visualDesign from state
- * Output: writtenContent tracking created nodes
+ * Output: Level 6 content nodes with actual training content
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
-import { AIMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { OrchestratorState, ContentOutput, PlannedNode } from "../state/agent-state";
 import { getCondensedBrief, getCondensedResearch } from "../state/agent-state";
+
+// Centralized context management utilities
+import {
+  filterOrphanedToolResults,
+  hasUsableResponse,
+} from "../utils";
+
+// Message filtering now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // MODEL CONFIGURATION
 // ============================================================================
 
 const writerModel = new ChatAnthropic({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-opus-4-5-20251101",
   maxTokens: 16000,
-  temperature: 0.6, // Creative but consistent
+  temperature: 0.7,
 });
+
+// Empty response detection now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // SYSTEM PROMPT
 // ============================================================================
 
-const WRITER_SYSTEM_PROMPT = `You are The Writer - a specialized agent focused on creating impactful training content.
+const WRITER_SYSTEM_PROMPT = `You are The Writer - you CREATE the actual training content that learners interact with.
 
 ## Your Role
 
-You write Level 6 content nodes - the actual training material that learners interact with. Your content:
+You work within the structure built by the Architect and create Level 6 content blocks - the actual training material. Your content:
 
 1. **Engages** - Captures and maintains learner attention
-2. **Educates** - Clearly explains concepts and procedures
+2. **Educates** - Clearly explains concepts and procedures  
 3. **Applies** - Connects theory to practical application
 4. **Adapts** - Matches the learner's level and industry context
 5. **Achieves** - Directly supports learning objectives
 
+## What You Do vs The Architect
+
+- **Architect** builds the skeleton: modules, lessons, topics (Levels 2-5)
+- **You** fill in the content: content blocks, activities, assessments (Level 6)
+
+The structure should already exist when you start. Your job is to create the actual training content within that structure.
+
 ## Your Tools
 
-You have full CRUD access for content creation:
-
-### Edit Mode
+### Edit Mode (REQUIRED)
 - **requestEditMode** - Request edit lock before making changes
 - **releaseEditMode** - Release edit lock when done
 
-### Node Operations
-- **createNode** - Create new content nodes
-- **getNodeTemplateFields** - Get field schema for a template
+### Content Creation
+- **createNode** - Create Level 6 content blocks
+- **getNodeTemplateFields** - Get field schema to understand what to write
 - **updateNodeFields** - Update content in existing nodes
 - **getNodeFields** - Read current content from nodes
+
+### Navigation (Find where to add content)
+- **getProjectHierarchyInfo** - Understand hierarchy levels
+- **getAvailableTemplates** - See what content templates exist
+- **getNodesByLevel** - Find parent nodes to add content under
+- **getNodeDetails** - Get detailed info about a node
+- **getNodeChildren** - See what content already exists
+
+### Media Integration
+- **searchMicroverse** - Find relevant images, videos, assets
+- **attachMicroverseToNode** - Attach media to your content
 
 ## Content Writing Process
 
 1. **Request Edit Mode** - Always start by requesting edit access
-2. **Review Context** - Understand the planned structure, research, and design
-3. **Get Template Fields** - Understand what fields need content
-4. **Write Content** - Create engaging, educational content
-5. **Create/Update Nodes** - Save content to the system
-6. **Release Edit Mode** - Free the lock for others
+2. **Navigate Structure** - Use getNodesByLevel to find where to add content
+3. **Check Templates** - Use getAvailableTemplates to see Level 6 content types
+4. **Get Field Schema** - Use getNodeTemplateFields to know what fields to fill
+5. **Write Content** - Create engaging, educational content
+6. **Create Content Node** - Use createNode with initialFields populated
+7. **Add Media** - Search and attach relevant media if appropriate
+8. **Repeat** - Continue for each content block needed
+9. **Release Edit Mode** - When done writing
 
 ## Writing Guidelines
 
@@ -73,7 +105,7 @@ You have full CRUD access for content creation:
 - Match the visual design's writing tone guidelines
 - Be consistent throughout the course
 - Use active voice when possible
-- Address learners directly (typically second person)
+- Address learners directly (second person: "you")
 
 ### Content Structure
 - Start with a clear learning objective or hook
@@ -95,30 +127,23 @@ You have full CRUD access for content creation:
 - Include industry examples and scenarios
 - Consider the learner's work context
 
-## Output Tracking
+## Content Types You Create
 
-Track created content:
-
-\`\`\`json
-{
-  "nodeId": "created-node-uuid",
-  "tempId": "m1-l1-c1",
-  "title": "Content Block Title",
-  "fieldsWritten": ["content", "summary"],
-  "createdAt": "2024-01-15T10:30:00Z",
-  "notes": "Any relevant notes"
-}
-\`\`\`
+- **Text Blocks** - Explanatory content, descriptions
+- **Lists** - Steps, bullet points, key takeaways
+- **Examples** - Case studies, scenarios, demonstrations
+- **Activities** - Interactive elements, reflection prompts
+- **Summaries** - Key points, recaps
 
 ## Guidelines
 
-- Create nodes ONE AT A TIME - wait for success before proceeding
-- Always check if edit mode is active before creating
+- Create content nodes ONE AT A TIME - wait for success
+- Find the parent node FIRST before creating under it
+- Fill in ALL relevant fields when creating
 - Match content to the learning objectives
 - Keep content scannable with headers and bullets
-- Include concrete examples over abstract theory
-- Write for your specific audience (not generic learners)
-- Maintain consistent formatting throughout
+- Use concrete examples over abstract theory
+- Consider adding media to enhance engagement
 
 Remember: Great content transforms learners. Every word should serve the learning experience.`;
 
@@ -140,16 +165,27 @@ export async function writerNode(
   console.log("  Nodes created in session:", state.createdNodes?.length || 0);
 
   // Get frontend tools from CopilotKit state
-  // The writer uses edit mode and node CRUD tools
+  // The writer uses CRUD for content + navigation to find structure + media tools
   const frontendActions = state.copilotkit?.actions ?? [];
   const writerTools = frontendActions.filter((action: { name: string }) =>
     [
+      // Edit mode management
       "requestEditMode",
       "releaseEditMode",
+      // Content CRUD
       "createNode",
       "getNodeTemplateFields",
       "updateNodeFields",
       "getNodeFields",
+      // Navigation (find where to add content)
+      "getProjectHierarchyInfo",
+      "getAvailableTemplates",
+      "getNodesByLevel",
+      "getNodeDetails",
+      "getNodeChildren",
+      // Media integration
+      "searchMicroverse",
+      "attachMicroverseToNode",
     ].includes(action.name)
   );
 
@@ -215,27 +251,63 @@ ${state.createdNodes.map((n) => `- "${n.title}" (ID: ${n.nodeId.substring(0, 8)}
     ? writerModel.bindTools(writerTools)
     : writerModel;
 
-  // Filter messages for this agent's context
-  const recentMessages = (state.messages || []).slice(-10);
+  // Filter messages for this agent's context - filter orphans first, then slice
+  // Filter AFTER slicing - slicing can create new orphans by removing AI messages with tool_use
+  const slicedMessages = (state.messages || []).slice(-10);
+  const recentMessages = filterOrphanedToolResults(slicedMessages, "[writer]");
 
   console.log("  Invoking writer model...");
 
-  const response = await modelWithTools.invoke(
+  let response = await modelWithTools.invoke(
     [systemMessage, ...recentMessages],
     config
   );
 
   console.log("  Writer response received");
 
-  const aiResponse = response as AIMessage;
+  let aiResponse = response as AIMessage;
   if (aiResponse.tool_calls?.length) {
     console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+  }
+
+  // RETRY LOGIC: If response is empty/thinking-only, retry with a nudge
+  if (!hasUsableResponse(aiResponse)) {
+    console.log("  [RETRY] Empty response detected - retrying with nudge message...");
+    
+    // Note: Using HumanMessage because SystemMessage must be first in the array
+    const nudgeMessage = new HumanMessage({
+      content: `[SYSTEM NUDGE] The previous response was empty. Please respond now:
+1. Call requestEditMode to get edit access
+2. Call getNodesByLevel to find where to add content
+3. Start creating content nodes
+
+The user is waiting for you to write content.`,
+    });
+
+    console.log("  [RETRY] Re-invoking with nudge...");
+    response = await modelWithTools.invoke(
+      [systemMessage, ...recentMessages, nudgeMessage],
+      config
+    );
+    
+    aiResponse = response as AIMessage;
+    
+    if (hasUsableResponse(aiResponse)) {
+      console.log("  [RETRY] Success - got usable response on retry");
+      if (aiResponse.tool_calls?.length) {
+        console.log("  [RETRY] Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+      }
+    } else {
+      console.log("  [RETRY] Failed - still empty after retry");
+    }
   }
 
   return {
     messages: [response],
     currentAgent: "writer",
     agentHistory: ["writer"],
+    // Clear routing decision when this agent starts - prevents stale routing
+    routingDecision: null,
   };
 }
 

@@ -2,18 +2,19 @@
  * Researcher Agent
  *
  * Deep knowledge gathering on industry, topics, regulations, and personas.
- * Uses web search and document RAG tools to build comprehensive research briefs.
+ * Uses web search, document RAG, and media library to build comprehensive research briefs.
  *
- * Tools (Backend only - no frontend access):
+ * Tools:
  * - web_search - Perplexity API search
- * - listDocuments, searchDocuments, searchDocumentsByText, getDocumentLines, getDocumentByName
+ * - listDocuments, searchDocuments, searchDocumentsByText, getDocumentLines, getDocumentByName - Document RAG
+ * - searchMicroverse, getMicroverseDetails - Media library search
  *
  * Input: Reads projectBrief from state
  * Output: researchFindings in shared state
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
-import { AIMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { z } from "zod";
@@ -22,15 +23,27 @@ import { createDocumentService, DocumentService } from "../../../src/documents/i
 import type { OrchestratorState, ResearchBrief } from "../state/agent-state";
 import { getCondensedBrief } from "../state/agent-state";
 
+// Centralized context management utilities
+import {
+  filterOrphanedToolResults,
+  clearOldToolResults,
+  hasUsableResponse,
+  MESSAGE_LIMITS,
+} from "../utils";
+
+// Message filtering now handled by centralized utils/context-management.ts
+
 // ============================================================================
 // MODEL CONFIGURATION
 // ============================================================================
 
 const researcherModel = new ChatAnthropic({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-opus-4-5-20251101",
   maxTokens: 16000,
-  temperature: 0.3, // Lower temperature for factual research
+  temperature: 0.7,
 });
+
+// Empty response detection now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // PERPLEXITY WEB SEARCH TOOL
@@ -351,8 +364,6 @@ You conduct thorough research to provide comprehensive information that will inf
 
 ## Your Tools
 
-You have backend research tools only (no frontend interaction):
-
 ### Web Search
 - **web_search** - Search the web via Perplexity AI for current information, trends, regulations
 
@@ -362,6 +373,10 @@ You have backend research tools only (no frontend interaction):
 - **searchDocumentsByText** - Exact term/phrase search
 - **getDocumentLines** - Get specific line ranges from documents
 - **getDocumentByName** - Get full document (use sparingly for small docs)
+
+### Media Library (Frontend)
+- **searchMicroverse** - Search existing media assets for reference materials
+- **getMicroverseDetails** - Get details about specific media assets
 
 ## Research Strategy
 
@@ -439,30 +454,82 @@ Continue researching to fill any gaps or go deeper on key topics.`;
 
   const systemMessage = new SystemMessage({ content: systemContent });
 
-  // Bind backend research tools
-  const modelWithTools = researcherModel.bindTools(researcherTools);
+  // Get frontend media tools from CopilotKit state
+  const frontendActions = state.copilotkit?.actions ?? [];
+  const mediaTools = frontendActions.filter((action: { name: string }) =>
+    ["searchMicroverse", "getMicroverseDetails"].includes(action.name)
+  );
 
-  // Filter messages for this agent's context
-  const recentMessages = (state.messages || []).slice(-15);
+  // Combine backend research tools with frontend media tools
+  const allResearcherTools = [...researcherTools, ...mediaTools];
+
+  // Bind all tools
+  const modelWithTools = researcherModel.bindTools(allResearcherTools);
+
+  // Filter messages for this agent's context - filter orphans first, then slice
+  // Context management pipeline for researcher (heavy tool usage):
+  // 1. Clear old tool results to prevent context bloat from large search/document outputs
+  // 2. Slice to recent messages
+  // 3. Filter orphaned tool results
+  const clearedMessages = clearOldToolResults(state.messages || [], {
+    keepCount: 5, // Keep last 5 tool results
+    logPrefix: "[researcher]",
+  });
+  const slicedMessages = clearedMessages.slice(-MESSAGE_LIMITS.subAgent);
+  const recentMessages = filterOrphanedToolResults(slicedMessages, "[researcher]");
 
   console.log("  Invoking researcher model with", researcherTools.length, "tools...");
 
-  const response = await modelWithTools.invoke(
+  let response = await modelWithTools.invoke(
     [systemMessage, ...recentMessages],
     config
   );
 
   console.log("  Researcher response received");
 
-  const aiResponse = response as AIMessage;
+  let aiResponse = response as AIMessage;
   if (aiResponse.tool_calls?.length) {
     console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+  }
+
+  // RETRY LOGIC: If response is empty/thinking-only, retry with a nudge
+  if (!hasUsableResponse(aiResponse)) {
+    console.log("  [RETRY] Empty response detected - retrying with nudge message...");
+    
+    // Note: Using HumanMessage because SystemMessage must be first in the array
+    const nudgeMessage = new HumanMessage({
+      content: `[SYSTEM NUDGE] The previous response was empty. Please respond now:
+1. Use the web_search tool to research the project topic
+2. OR use document search tools to find relevant internal content
+3. Provide a brief status update to the user
+
+The user is waiting for research results.`,
+    });
+
+    console.log("  [RETRY] Re-invoking with nudge...");
+    response = await modelWithTools.invoke(
+      [systemMessage, ...recentMessages, nudgeMessage],
+      config
+    );
+    
+    aiResponse = response as AIMessage;
+    
+    if (hasUsableResponse(aiResponse)) {
+      console.log("  [RETRY] Success - got usable response on retry");
+      if (aiResponse.tool_calls?.length) {
+        console.log("  [RETRY] Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+      }
+    } else {
+      console.log("  [RETRY] Failed - still empty after retry");
+    }
   }
 
   return {
     messages: [response],
     currentAgent: "researcher",
     agentHistory: ["researcher"],
+    // Clear routing decision when this agent starts - prevents stale routing
+    routingDecision: null,
   };
 }
 

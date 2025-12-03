@@ -1,134 +1,139 @@
 /**
  * Architect Agent
  *
- * Structures training content for maximum learning impact.
- * Applies frameworks thoughtfully without rigid adherence.
+ * Builds the STRUCTURE of training courses (Levels 2-5).
+ * Creates modules, lessons, topics, and sub-topics.
+ * Does NOT write final content - that's the Writer's job.
  *
- * Tools (Read-only frontend):
+ * Tools (Full CRUD for structure):
+ * - requestEditMode, releaseEditMode - Edit lock management
+ * - createNode - Create structural nodes (modules, lessons, topics)
  * - getProjectHierarchyInfo - Understand hierarchy levels and coding
  * - getAvailableTemplates - See what node types can be created
+ * - getNodeTemplateFields - Get field schema for templates
  * - getNodesByLevel - See existing nodes at specific levels
  * - getNodeChildren - Check children of specific nodes
+ * - getNodeDetails - Get detailed node information
+ * - listAllNodeTemplates - See all available templates
  *
  * Input: Reads projectBrief and researchFindings from state
- * Output: courseStructure in shared state
+ * Output: Creates structural nodes in the project
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
-import { AIMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { OrchestratorState, CourseStructure, PlannedNode } from "../state/agent-state";
 import { getCondensedBrief, getCondensedResearch } from "../state/agent-state";
+
+// Centralized context management utilities
+import {
+  filterOrphanedToolResults,
+  hasUsableResponse,
+} from "../utils";
+
+// Message filtering now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // MODEL CONFIGURATION
 // ============================================================================
 
 const architectModel = new ChatAnthropic({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-opus-4-5-20251101",
   maxTokens: 16000,
-  temperature: 0.5, // Balanced for creative structure with practical constraints
+  temperature: 0.7,
 });
+
+// Empty response detection now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // SYSTEM PROMPT
 // ============================================================================
 
-const ARCHITECT_SYSTEM_PROMPT = `You are The Architect - a specialized agent focused on structuring online training for maximum learning impact.
+const ARCHITECT_SYSTEM_PROMPT = `You are The Architect - you BUILD the structure of online training courses.
 
 ## Your Role
 
-You design course structures that:
-1. **Maximize Learning** - Structure content for optimal retention and application
-2. **Follow Logical Flow** - Build knowledge progressively, concept upon concept
-3. **Balance Depth & Breadth** - Cover enough without overwhelming
-4. **Meet Requirements** - Satisfy objectives, regulations, and constraints
-5. **Engage Learners** - Create varied, interesting learning experiences
+You CREATE the structural framework of courses by building nodes at Levels 2-5:
+- **Level 2**: Modules/Sections - Major topic areas
+- **Level 3**: Lessons/Topics - Focused learning units
+- **Level 4**: Sub-topics - Detailed breakdowns
+- **Level 5**: Activities - Specific learning activities
 
-## Your Philosophy
+**IMPORTANT**: You do NOT write the final content (Level 6 content blocks). That's the Writer's job. You build the skeleton; they fill in the content.
 
-You understand that great training structure goes BEYOND simply mapping frameworks 1:1. Instead, you:
-- Use frameworks as guides, not rigid templates
-- Prioritize learner experience over bureaucratic compliance
-- Create natural learning progressions
-- Group related concepts meaningfully
-- Include practical application opportunities
-- Balance theory with hands-on activities
+## What You Do
+
+1. **Understand Structure** - Use tools to see hierarchy config and existing nodes
+2. **Design Structure** - Plan modules, lessons, topics based on brief and research
+3. **Create Nodes** - Actually BUILD the structure by creating nodes in the system
+4. **Organize Flow** - Ensure logical progression and parent-child relationships
 
 ## Your Tools
 
-You have read-only access to understand the project structure:
+### Edit Mode (REQUIRED before creating)
+- **requestEditMode** - Request edit lock before making changes
+- **releaseEditMode** - Release edit lock when done
 
-### Hierarchy Tools
-- **getProjectHierarchyInfo** - Understand available hierarchy levels and coding
+### Node Creation
+- **createNode** - Create structural nodes (modules, lessons, topics, activities)
+- **getNodeTemplateFields** - Get field schema for templates
+
+### Understanding Structure
+- **getProjectHierarchyInfo** - Understand hierarchy levels and coding
 - **getAvailableTemplates** - See what node templates can be used
+- **listAllNodeTemplates** - See ALL templates available
 - **getNodesByLevel** - See existing nodes at specific levels
 - **getNodeChildren** - Check children of specific nodes
+- **getNodeDetails** - Get detailed node information
 
-## Course Structure Design
+## Building Process
 
-### Hierarchy Levels (typical)
-- **Level 2: Modules/Sections** - Major topic areas (3-8 typically)
-- **Level 3: Lessons/Topics** - Focused learning units within modules
-- **Level 4: Sub-topics** - Detailed breakdowns when needed
-- **Level 5: Activities** - Specific learning activities
-- **Level 6: Content Blocks** - Actual content pieces
+1. **Request Edit Mode** - Always start by requesting edit access
+2. **Check Hierarchy** - Use getProjectHierarchyInfo to understand levels
+3. **Review Templates** - Use getAvailableTemplates to see what can be created
+4. **Create Level 2 First** - Build modules (major sections)
+5. **Create Level 3 Under Each** - Build lessons within modules
+6. **Continue Down** - Add sub-topics and activities as needed
+7. **Release Edit Mode** - When structure is complete
 
-### Design Principles
+## Design Principles
 
-1. **Chunking** - Break content into digestible pieces (7±2 items per level)
+1. **Chunking** - 5-7 items per parent (not too many children)
 2. **Scaffolding** - Build from simple to complex
-3. **Interleaving** - Mix related topics for better retention
-4. **Spacing** - Distribute practice across the course
-5. **Variation** - Use different content types and activities
+3. **Logical Flow** - Each level should progress naturally
+4. **Clear Naming** - Descriptive titles that indicate content
+5. **Balanced Depth** - Don't go deeper than necessary
 
-## Output Format
+## Node Creation Guidelines
 
-Produce a detailed course structure:
+When creating nodes:
+- Create ONE node at a time - wait for success before proceeding
+- Start with Level 2 (modules) - they have no parent
+- For Level 3+, always specify the parentNodeId
+- Use descriptive titles
+- Match node types to templates available at each level
 
-\`\`\`json
-{
-  "summary": "Brief description of the overall structure",
-  "rationale": "Why this structure was chosen",
-  "maxDepth": 4,
-  "totalNodes": 25,
-  "nodes": [
-    {
-      "tempId": "m1",
-      "title": "Module Title",
-      "nodeType": "module",
-      "level": 2,
-      "parentTempId": null,
-      "description": "What this module covers",
-      "objectives": ["Objective 1", "Objective 2"],
-      "orderIndex": 1
-    },
-    {
-      "tempId": "m1-l1",
-      "title": "Lesson Title",
-      "nodeType": "lesson",
-      "level": 3,
-      "parentTempId": "m1",
-      "description": "What this lesson covers",
-      "orderIndex": 1
-    }
-  ]
-}
+## Example Flow
+
+\`\`\`
+1. requestEditMode
+2. getProjectHierarchyInfo (understand levels)
+3. getAvailableTemplates (see Level 2 options)
+4. createNode: "Introduction to Risk Management" (Level 2, module)
+5. createNode: "Understanding Risk" (Level 3, lesson, parent=above)
+6. createNode: "Types of Risk" (Level 3, lesson, parent=module)
+7. ... continue building structure
+8. releaseEditMode
 \`\`\`
 
-## Guidelines
+## What NOT To Do
 
-- Start by understanding the hierarchy configuration
-- Review the project brief for scope and objectives
-- Use research findings to inform topic selection
-- Create logical parent-child relationships
-- Assign meaningful tempIds for reference (e.g., "m1", "m1-l1", "m1-l1-t1")
-- Include clear descriptions for each node
-- Map learning objectives to specific nodes
-- Consider the target audience's prior knowledge
-- Plan for variety in content types
+- Do NOT create Level 6 content blocks - that's the Writer's job
+- Do NOT fill in detailed content fields - just structure
+- Do NOT create too many nodes at once - build systematically
 
-Remember: A well-structured course makes the difference between forgettable training and transformative learning.`;
+Remember: A well-structured course makes the difference between forgettable training and transformative learning. Build the skeleton that the Writer will bring to life.`;
 
 // ============================================================================
 // ARCHITECT NODE FUNCTION
@@ -147,10 +152,24 @@ export async function architectNode(
   console.log("  Research findings available:", state.researchFindings ? "yes" : "no");
 
   // Get frontend tools from CopilotKit state
-  // The architect only uses read-only hierarchy tools
+  // The architect uses CRUD tools to build structure + read tools to understand hierarchy
   const frontendActions = state.copilotkit?.actions ?? [];
   const architectTools = frontendActions.filter((action: { name: string }) =>
-    ["getProjectHierarchyInfo", "getAvailableTemplates", "getNodesByLevel", "getNodeChildren"].includes(action.name)
+    [
+      // Edit mode management
+      "requestEditMode",
+      "releaseEditMode",
+      // Node creation
+      "createNode",
+      "getNodeTemplateFields",
+      // Structure understanding
+      "getProjectHierarchyInfo",
+      "getAvailableTemplates",
+      "listAllNodeTemplates",
+      "getNodesByLevel",
+      "getNodeChildren",
+      "getNodeDetails",
+    ].includes(action.name)
   );
 
   console.log("  Available tools:", architectTools.map((t: { name: string }) => t.name).join(", ") || "none");
@@ -188,27 +207,63 @@ You may refine or extend this existing structure.`;
     ? architectModel.bindTools(architectTools)
     : architectModel;
 
-  // Filter messages for this agent's context
-  const recentMessages = (state.messages || []).slice(-12);
+  // Filter messages for this agent's context - filter orphans first, then slice
+  // Filter AFTER slicing - slicing can create new orphans by removing AI messages with tool_use
+  const slicedMessages = (state.messages || []).slice(-12);
+  const recentMessages = filterOrphanedToolResults(slicedMessages, "[architect]");
 
   console.log("  Invoking architect model...");
 
-  const response = await modelWithTools.invoke(
+  let response = await modelWithTools.invoke(
     [systemMessage, ...recentMessages],
     config
   );
 
   console.log("  Architect response received");
 
-  const aiResponse = response as AIMessage;
+  let aiResponse = response as AIMessage;
   if (aiResponse.tool_calls?.length) {
     console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+  }
+
+  // RETRY LOGIC: If response is empty/thinking-only, retry with a nudge
+  if (!hasUsableResponse(aiResponse)) {
+    console.log("  [RETRY] Empty response detected - retrying with nudge message...");
+    
+    // Note: Using HumanMessage because SystemMessage must be first in the array
+    const nudgeMessage = new HumanMessage({
+      content: `[SYSTEM NUDGE] The previous response was empty. Please respond now:
+1. Call getProjectHierarchyInfo to understand the structure
+2. Call getAvailableTemplates to see what you can create
+3. Start designing and creating nodes
+
+The user is waiting for you to build the course structure.`,
+    });
+
+    console.log("  [RETRY] Re-invoking with nudge...");
+    response = await modelWithTools.invoke(
+      [systemMessage, ...recentMessages, nudgeMessage],
+      config
+    );
+    
+    aiResponse = response as AIMessage;
+    
+    if (hasUsableResponse(aiResponse)) {
+      console.log("  [RETRY] Success - got usable response on retry");
+      if (aiResponse.tool_calls?.length) {
+        console.log("  [RETRY] Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+      }
+    } else {
+      console.log("  [RETRY] Failed - still empty after retry");
+    }
   }
 
   return {
     messages: [response],
     currentAgent: "architect",
     agentHistory: ["architect"],
+    // Clear routing decision when this agent starts - prevents stale routing
+    routingDecision: null,
   };
 }
 

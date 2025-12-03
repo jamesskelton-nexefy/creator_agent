@@ -7,24 +7,37 @@
  * Tools:
  * - askClarifyingQuestions (frontend HITL) - Sequential questions with options
  * - offerOptions (frontend HITL) - Present choices to user
+ * - getProjectHierarchyInfo - Understand project structure when scoping
+ * - listProjects - Check existing projects for reference
  *
  * Output: projectBrief in shared state
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
-import { AIMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { OrchestratorState, ProjectBrief } from "../state/agent-state";
+
+// Centralized context management utilities
+import {
+  filterOrphanedToolResults,
+  stripThinkingBlocks,
+  hasUsableResponse,
+} from "../utils";
+
+// Message filtering and thinking block stripping now handled by centralized utils
 
 // ============================================================================
 // MODEL CONFIGURATION
 // ============================================================================
 
 const strategistModel = new ChatAnthropic({
-  model: "claude-sonnet-4-20250514",
-  maxTokens: 8000,
-  temperature: 0.7, // Slightly creative for strategy discussions
+  model: "claude-opus-4-5-20251101",
+  maxTokens: 16000,
+  temperature: 0.7, // Thinking disabled - strategist is conversational, not analytical
 });
+
+// Empty response detection now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // SYSTEM PROMPT
@@ -59,7 +72,7 @@ Use this for single-choice decisions when you need the user to pick between appr
 ## Strategy Session Flow
 
 1. **Greet and Orient** - Briefly explain your role
-2. **Ask Key Questions** - Use askClarifyingQuestions to gather:
+2. **IMMEDIATELY Ask Key Questions** - You MUST call askClarifyingQuestions right away to gather:
    - Primary training purpose/goal
    - Target audience (role, experience level)
    - Industry/domain context
@@ -67,6 +80,26 @@ Use this for single-choice decisions when you need the user to pick between appr
    - Any constraints or requirements
 3. **Synthesize** - Process user responses into a structured project brief
 4. **Confirm** - Summarize back and get confirmation
+
+## CRITICAL: Tool Usage - READ THIS CAREFULLY
+
+**YOU MUST CALL askClarifyingQuestions ON YOUR FIRST TURN.**
+
+DO NOT:
+- Just think about asking questions
+- Just write text explaining what you'll do
+- Produce only thinking blocks with no tool call
+- Say "I will ask..." without actually calling the tool
+
+DO:
+- IMMEDIATELY call the askClarifyingQuestions tool
+- Include a brief greeting in text AND call the tool in the same response
+
+Example of CORRECT behavior:
+1. Output a brief greeting text: "Hi! I'm the Strategist..."
+2. ALSO call askClarifyingQuestions tool with your questions
+
+If you produce thinking but no tool call or text, the user sees NOTHING and the conversation hangs.
 
 ## Output Format
 
@@ -89,6 +122,21 @@ After gathering information, structure your findings as a project brief that inc
 - Default to sensible assumptions when not specified
 - Always validate your understanding before finalizing
 
+## Communication Flow
+
+**On your FIRST turn:**
+- ALWAYS call askClarifyingQuestions tool - this is mandatory
+- You can include a brief text greeting along with the tool call
+
+**When asking follow-up questions:**
+- Use askClarifyingQuestions or offerOptions tools - NOT plain text
+- Tools provide better UI with clickable options
+
+**When you've completed gathering requirements:**
+- Summarize the project brief in text
+- Include [DONE] at the end of your message to hand back to the orchestrator
+- Example: "Here's the project brief I've compiled... [DONE]"
+
 Remember: Your output directly shapes everything that follows. A clear, well-defined project brief leads to better research, structure, and content.`;
 
 // ============================================================================
@@ -107,10 +155,17 @@ export async function strategistNode(
   console.log("  Current project brief:", state.projectBrief ? "exists" : "none");
 
   // Get frontend tools from CopilotKit state
-  // The strategist only uses: askClarifyingQuestions, offerOptions
+  // The strategist uses conversation tools + minimal read tools for context
   const frontendActions = state.copilotkit?.actions ?? [];
   const strategistTools = frontendActions.filter((action: { name: string }) =>
-    ["askClarifyingQuestions", "offerOptions"].includes(action.name)
+    [
+      // Conversation tools
+      "askClarifyingQuestions",
+      "offerOptions",
+      // Context tools (understand what exists)
+      "getProjectHierarchyInfo",
+      "listProjects",
+    ].includes(action.name)
   );
 
   console.log("  Available tools:", strategistTools.map((t: { name: string }) => t.name).join(", ") || "none");
@@ -139,27 +194,88 @@ Continue gathering any missing information or refine what's been captured.`;
     : strategistModel;
 
   // Filter messages for this agent's context (keep it focused)
-  const recentMessages = (state.messages || []).slice(-10);
+  // 1. Strip thinking blocks (strategist has thinking disabled but receives from orchestrator with thinking enabled)
+  // 2. Slice to recent messages
+  // 3. Filter orphaned tool results AFTER slicing (slicing can create new orphans!)
+  const strippedMessages = stripThinkingBlocks(state.messages || []);
+  const slicedMessages = strippedMessages.slice(-10);
+  const recentMessages = filterOrphanedToolResults(slicedMessages, "[strategist]");
 
   console.log("  Invoking strategist model...");
 
-  const response = await modelWithTools.invoke(
+  let response = await modelWithTools.invoke(
     [systemMessage, ...recentMessages],
     config
   );
 
   console.log("  Strategist response received");
   
-  // Log tool calls if present
-  const aiResponse = response as AIMessage;
+  // Log response details for debugging
+  let aiResponse = response as AIMessage;
+  
+  // Check tool calls
   if (aiResponse.tool_calls?.length) {
     console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+  } else {
+    console.log("  No tool calls in response");
+  }
+  
+  // Check content type
+  const content = aiResponse.content;
+  if (typeof content === "string") {
+    console.log("  Response type: string, length:", content.length);
+  } else if (Array.isArray(content)) {
+    const blockTypes = content.map((b: any) => b?.type || typeof b).join(", ");
+    console.log("  Response type: array, blocks:", blockTypes);
+    
+    // Check for text blocks
+    const textBlocks = content.filter((b: any) => b?.type === "text");
+    if (textBlocks.length === 0) {
+      console.log("  WARNING: No text blocks in response - only thinking");
+    } else {
+      const textLength = textBlocks.reduce((sum: number, b: any) => sum + (b.text?.length || 0), 0);
+      console.log("  Text content length:", textLength);
+    }
+  }
+
+  // RETRY LOGIC: If response is empty/thinking-only, retry with a nudge
+  if (!hasUsableResponse(aiResponse)) {
+    console.log("  [RETRY] Empty response detected - retrying with nudge message...");
+    
+    // Add a nudge message to prompt the model to take action
+    // Note: Using HumanMessage because SystemMessage must be first in the array
+    const nudgeMessage = new HumanMessage({
+      content: `[SYSTEM NUDGE] The previous response was empty. Please respond now:
+1. Greet the user briefly
+2. IMMEDIATELY call the askClarifyingQuestions tool to start gathering project requirements
+
+The user is waiting for your response.`,
+    });
+
+    console.log("  [RETRY] Re-invoking with nudge...");
+    response = await modelWithTools.invoke(
+      [systemMessage, ...recentMessages, nudgeMessage],
+      config
+    );
+    
+    aiResponse = response as AIMessage;
+    
+    if (hasUsableResponse(aiResponse)) {
+      console.log("  [RETRY] Success - got usable response on retry");
+      if (aiResponse.tool_calls?.length) {
+        console.log("  [RETRY] Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+      }
+    } else {
+      console.log("  [RETRY] Failed - still empty after retry");
+    }
   }
 
   return {
     messages: [response],
     currentAgent: "strategist",
     agentHistory: ["strategist"],
+    // Clear routing decision when this agent starts - prevents stale routing
+    routingDecision: null,
   };
 }
 

@@ -3,29 +3,47 @@
  *
  * Defines course aesthetics - fonts, colors, branding, and writing tone.
  * Presents design options for user selection.
+ * Can research design trends and find existing brand assets.
  *
- * Tools (Presentation):
+ * Tools:
  * - offerOptions - Present design choices to user
+ * - web_search - Research design trends, industry standards, color psychology
+ * - searchMicroverse - Find existing brand assets, logos, images
+ * - getMicroverseDetails - Get asset information
  *
  * Input: Reads projectBrief from state
  * Output: visualDesign spec in shared state
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
-import { AIMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { OrchestratorState, VisualDesign } from "../state/agent-state";
 import { getCondensedBrief } from "../state/agent-state";
+import { researcherTools } from "./researcher";
+
+// Centralized context management utilities
+import {
+  filterOrphanedToolResults,
+  hasUsableResponse,
+} from "../utils";
+
+// Extract just the web_search tool for the designer
+const webSearchTool = researcherTools.find((t) => t.name === "web_search");
+
+// Message filtering now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // MODEL CONFIGURATION
 // ============================================================================
 
 const designerModel = new ChatAnthropic({
-  model: "claude-sonnet-4-20250514",
-  maxTokens: 8000,
-  temperature: 0.7, // Creative for design suggestions
+  model: "claude-opus-4-5-20251101",
+  maxTokens: 16000,
+  temperature: 0.7,
 });
+
+// Empty response detection now handled by centralized utils/context-management.ts
 
 // ============================================================================
 // DESIGN PRESETS
@@ -181,14 +199,15 @@ You create cohesive visual and tonal identities that:
 
 ## Your Tools
 
-You use Human-in-the-Loop tools to present choices:
+### User Interaction
+- **offerOptions** - Present 2-3 design options for user to choose from
 
-### offerOptions
-Present 2-3 design options for the user to choose from. Use this for:
-- Theme/style selection
-- Color palette choices
-- Typography preferences
-- Writing tone decisions
+### Research
+- **web_search** - Research design trends, industry standards, color psychology, accessibility best practices
+
+### Asset Discovery
+- **searchMicroverse** - Find existing brand assets, logos, images in the media library
+- **getMicroverseDetails** - Get details about specific assets
 
 ## Design Process
 
@@ -276,9 +295,20 @@ export async function visualDesignerNode(
 
   // Get frontend tools from CopilotKit state
   const frontendActions = state.copilotkit?.actions ?? [];
-  const designerTools = frontendActions.filter((action: { name: string }) =>
-    ["offerOptions"].includes(action.name)
+  const frontendDesignerTools = frontendActions.filter((action: { name: string }) =>
+    [
+      // User interaction
+      "offerOptions",
+      // Media/asset search
+      "searchMicroverse",
+      "getMicroverseDetails",
+    ].includes(action.name)
   );
+
+  // Combine frontend tools with backend web_search tool
+  const designerTools = webSearchTool
+    ? [...frontendDesignerTools, webSearchTool]
+    : frontendDesignerTools;
 
   console.log("  Available tools:", designerTools.map((t: { name: string }) => t.name).join(", ") || "none");
 
@@ -331,27 +361,63 @@ The user may want to adjust specific elements of this design.`;
     ? designerModel.bindTools(designerTools)
     : designerModel;
 
-  // Filter messages for this agent's context
-  const recentMessages = (state.messages || []).slice(-8);
+  // Filter messages for this agent's context - filter orphans first, then slice
+  // Filter AFTER slicing - slicing can create new orphans by removing AI messages with tool_use
+  const slicedMessages = (state.messages || []).slice(-8);
+  const recentMessages = filterOrphanedToolResults(slicedMessages, "[visual_designer]");
 
   console.log("  Invoking visual designer model...");
 
-  const response = await modelWithTools.invoke(
+  let response = await modelWithTools.invoke(
     [systemMessage, ...recentMessages],
     config
   );
 
   console.log("  Visual designer response received");
 
-  const aiResponse = response as AIMessage;
+  let aiResponse = response as AIMessage;
   if (aiResponse.tool_calls?.length) {
     console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+  }
+
+  // RETRY LOGIC: If response is empty/thinking-only, retry with a nudge
+  if (!hasUsableResponse(aiResponse)) {
+    console.log("  [RETRY] Empty response detected - retrying with nudge message...");
+    
+    // Note: Using HumanMessage because SystemMessage must be first in the array
+    const nudgeMessage = new HumanMessage({
+      content: `[SYSTEM NUDGE] The previous response was empty. Please respond now:
+1. Greet the user briefly
+2. Use the offerOptions tool to present design theme choices
+3. OR ask about their design preferences
+
+The user is waiting for design options.`,
+    });
+
+    console.log("  [RETRY] Re-invoking with nudge...");
+    response = await modelWithTools.invoke(
+      [systemMessage, ...recentMessages, nudgeMessage],
+      config
+    );
+    
+    aiResponse = response as AIMessage;
+    
+    if (hasUsableResponse(aiResponse)) {
+      console.log("  [RETRY] Success - got usable response on retry");
+      if (aiResponse.tool_calls?.length) {
+        console.log("  [RETRY] Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+      }
+    } else {
+      console.log("  [RETRY] Failed - still empty after retry");
+    }
   }
 
   return {
     messages: [response],
     currentAgent: "visual_designer",
     agentHistory: ["visual_designer"],
+    // Clear routing decision when this agent starts - prevents stale routing
+    routingDecision: null,
   };
 }
 

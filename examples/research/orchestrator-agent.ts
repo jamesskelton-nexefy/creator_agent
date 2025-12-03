@@ -30,152 +30,133 @@ import {
   OrchestratorState,
   AgentType,
   summarizeAgentContext,
-  hasAgentOutput,
 } from "./state/agent-state";
+
+// Centralized context management utilities
+import {
+  filterOrphanedToolResults,
+  trimMessages,
+  summarizeIfNeeded,
+  MESSAGE_LIMITS,
+  TOKEN_LIMITS,
+} from "./utils";
 
 import {
   strategistNode,
-  parseProjectBrief,
+  parseProjectBrief as _parseProjectBrief,
   researcherNode,
   researcherTools,
-  parseResearchFindings,
+  parseResearchFindings as _parseResearchFindings,
   architectNode,
-  parseCourseStructure,
+  parseCourseStructure as _parseCourseStructure,
   writerNode,
-  extractContentOutput,
+  extractContentOutput as _extractContentOutput,
   visualDesignerNode,
-  parseVisualDesign,
+  parseVisualDesign as _parseVisualDesign,
 } from "./agents/index";
 
+// Re-export parsing utilities for external use
+export {
+  _parseProjectBrief as parseProjectBrief,
+  _parseResearchFindings as parseResearchFindings,
+  _parseCourseStructure as parseCourseStructure,
+  _extractContentOutput as extractContentOutput,
+  _parseVisualDesign as parseVisualDesign,
+};
+
+// Message filtering and trimming now handled by centralized utils/context-management.ts
+
 // ============================================================================
-// MESSAGE FILTERING - Fix orphaned tool results and empty messages
+// FRONTEND TOOL DETECTION - Identify frontend vs backend tool messages
 // ============================================================================
 
-function hasNonEmptyTextContent(msg: AIMessage): boolean {
-  const content = msg.content;
+/**
+ * Checks if a message is a ToolMessage (tool_result) from a frontend tool.
+ * Frontend tools are any tools NOT in the researcherTools list (backend tools).
+ * 
+ * Used to keep the graph alive when frontend tools are called - we wait for
+ * CopilotKit to send the tool_result back instead of ending the graph.
+ * 
+ * Note: Prefixed with underscore as it's available for future use but not currently needed.
+ * The routing logic uses isToolResultMessage() which is sufficient since backend tool
+ * results go through execute_backend_tools node with its own routing.
+ */
+function _isFrontendToolResult(msg: BaseMessage): boolean {
+  const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
+  if (msgType !== "tool" && msgType !== "ToolMessage") return false;
 
-  if (typeof content === "string") {
-    return content.trim().length > 0;
-  }
-
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      if (typeof block === "string" && block.trim().length > 0) {
-        return true;
-      }
-      if (typeof block === "object" && block !== null) {
-        if ("type" in block && block.type === "text" && "text" in block) {
-          const text = (block as any).text;
-          if (typeof text === "string" && text.trim().length > 0) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-
-  if (msg.tool_calls && msg.tool_calls.length > 0) {
-    return true;
-  }
-
-  return false;
+  const toolMsg = msg as ToolMessage;
+  const backendToolNames = new Set(researcherTools.map((t) => t.name));
+  
+  // It's a frontend tool result if the tool name is NOT in backend tools
+  return !backendToolNames.has(toolMsg.name || "");
 }
 
-function filterOrphanedToolResults(messages: BaseMessage[]): BaseMessage[] {
-  const filtered: BaseMessage[] = [];
+/**
+ * Checks if the last message in state is a ToolMessage (tool_result).
+ * Used to detect when CopilotKit has sent back a tool result.
+ * 
+ * Note: Prefixed with underscore as it's available for future use but not currently needed.
+ */
+function _isToolResultMessage(msg: BaseMessage): boolean {
+  const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
+  return msgType === "tool" || msgType === "ToolMessage";
+}
 
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
+/**
+ * Checks if there's a pending uploadDocument action in the recent messages.
+ * Returns "document_upload" if the uploadDocument tool was called and returned
+ * a prompt to upload (not an actual upload completion).
+ * Returns null if no pending upload or if upload is complete.
+ */
+function detectPendingUpload(messages: BaseMessage[]): string | null {
+  // Look through recent messages for uploadDocument tool patterns
+  const recentMessages = messages.slice(-10);
+  
+  let hasUploadPrompt = false;
+  let hasUploadCompletion = false;
+  
+  for (const msg of recentMessages) {
     const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
-
-    if (msgType === "ai" || msgType === "AIMessage") {
-      const aiMsg = msg as AIMessage;
-      if (!hasNonEmptyTextContent(aiMsg)) {
-        console.log(`  [FILTER] Removing AI message with empty text content`);
-        continue;
-      }
-    }
-
+    
     if (msgType === "tool" || msgType === "ToolMessage") {
       const toolMsg = msg as ToolMessage;
-      const toolCallId = toolMsg.tool_call_id;
-
-      let hasMatchingToolUse = false;
-      for (let j = filtered.length - 1; j >= 0; j--) {
-        const prevMsg = filtered[j];
-        const prevType = (prevMsg as any)._getType?.() || (prevMsg as any).constructor?.name || "";
-
-        if (prevType === "ai" || prevType === "AIMessage") {
-          const aiMsg = prevMsg as AIMessage;
-          if (aiMsg.tool_calls?.some((tc) => tc.id === toolCallId)) {
-            hasMatchingToolUse = true;
+      
+      // Check if this is an uploadDocument result
+      if (toolMsg.name === "uploadDocument") {
+        try {
+          const content = typeof toolMsg.content === "string" ? toolMsg.content : JSON.stringify(toolMsg.content);
+          const parsed = JSON.parse(content);
+          
+          // If the tool returned success with a "please upload" message, it's a prompt
+          if (parsed.success && (parsed.message?.includes("upload") || parsed.note?.includes("Click"))) {
+            hasUploadPrompt = true;
           }
-          break;
+          
+          // If there's a documentId, the upload is complete
+          if (parsed.documentId) {
+            hasUploadCompletion = true;
+          }
+        } catch {
+          // If we can't parse, check for keywords in raw content
+          const content = typeof toolMsg.content === "string" ? toolMsg.content : "";
+          if (content.includes("Please upload") || content.includes("select a file")) {
+            hasUploadPrompt = true;
+          }
+          if (content.includes("documentId")) {
+            hasUploadCompletion = true;
+          }
         }
       }
-
-      if (!hasMatchingToolUse) {
-        console.log(`  [FILTER] Removing orphaned tool result: ${toolCallId}`);
-        continue;
-      }
     }
-
-    filtered.push(msg);
   }
-
-  return filtered;
-}
-
-function trimMessages(messages: BaseMessage[], keepRecent: number = 40): BaseMessage[] {
-  if (messages.length <= keepRecent) {
-    return messages;
+  
+  // If there's a prompt but no completion, we're waiting for upload
+  if (hasUploadPrompt && !hasUploadCompletion) {
+    return "document_upload";
   }
-
-  const systemMessages = messages.filter((m) => {
-    const msgType = (m as any)._getType?.() || (m as any).constructor?.name || "";
-    return msgType === "system" || msgType === "SystemMessage";
-  });
-
-  const otherMessages = messages.filter((m) => {
-    const msgType = (m as any)._getType?.() || (m as any).constructor?.name || "";
-    return msgType !== "system" && msgType !== "SystemMessage";
-  });
-
-  let startIdx = Math.max(0, otherMessages.length - keepRecent);
-
-  while (startIdx < otherMessages.length) {
-    const msg = otherMessages[startIdx];
-    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
-
-    if (msgType === "human" || msgType === "HumanMessage") {
-      break;
-    }
-
-    if (msgType === "tool" || msgType === "ToolMessage") {
-      startIdx++;
-      continue;
-    }
-
-    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
-      const aiMsg = msg as any;
-      const hasToolCalls = aiMsg.tool_calls?.length > 0;
-      if (!hasToolCalls) {
-        break;
-      }
-      startIdx++;
-      continue;
-    }
-
-    startIdx++;
-  }
-
-  const recentMessages = otherMessages.slice(startIdx);
-
-  console.log(
-    `  [TRIM] Messages: ${messages.length} -> ${systemMessages.length + recentMessages.length}`
-  );
-
-  return [...systemMessages, ...recentMessages];
+  
+  return null;
 }
 
 // ============================================================================
@@ -184,12 +165,13 @@ function trimMessages(messages: BaseMessage[], keepRecent: number = 40): BaseMes
 
 const orchestratorModel = new ChatAnthropic({
   model: "claude-opus-4-5-20251101",
-  maxTokens: 32000,
-  thinking: {
-    type: "enabled",
-    budget_tokens: 10000,
+  maxTokens: 16000,
+  temperature: 0.7,
+  // Enable Anthropic prompt caching for system prompts
+  // This caches the static system prompt, reducing costs by ~10x for repeated calls
+  clientOptions: {
+    defaultHeaders: { "anthropic-beta": "prompt-caching-2024-07-31" },
   },
-  temperature: 1,
 });
 
 // ============================================================================
@@ -250,40 +232,157 @@ You have 5 specialized sub-agents, each with specific capabilities:
 ## Your Role
 
 As the Orchestrator, you:
-1. **Analyze requests** - Understand what the user needs
-2. **Route to agents** - Delegate to the right specialist
-3. **Manage context** - Pass relevant information between agents
-4. **Coordinate workflow** - Ensure proper sequencing
-5. **Handle general tasks** - Answer questions, provide status updates
+1. **Perform direct actions** - You can do MANY things yourself using frontend tools
+2. **Analyze requests** - Understand what the user needs
+3. **Route to specialists** - ONLY delegate when specialist knowledge is needed
+4. **Manage context** - Pass relevant information between agents
+5. **Coordinate workflow** - Ensure proper sequencing
 
-## Your Tools
+## Your Tools (Direct Actions)
 
-You have access to:
-- **requestPlanApproval** - Get user approval before major actions
-- **requestActionApproval** - Confirm sensitive operations
-- **offerOptions** - Present choices when needed
-- **getProjectHierarchyInfo** - Understand project structure
-- **getNodeChildren** - Check existing content
+You have access to ALL frontend tools. Here's how to use each:
+
+### Navigation & View Control
+- **navigateToProject(projectId)** - Navigate to a specific project by ID
+- **goToProjectsList()** - Return to the projects list page
+- **switchViewMode(mode)** - Change view: "document", "list", "graph", or "table"
+- **selectNode(nodeId)** - Select a node in the tree
+- **scrollToNode(nodeId)** - Scroll to make a node visible
+- **expandNode(nodeId)** - Expand a collapsed node
+- **collapseNode(nodeId)** - Collapse an expanded node
+- **expandAllNodes()** - Expand entire tree
+- **collapseAllNodes()** - Collapse entire tree
+- **toggleDetailPane()** - Show/hide the detail panel
+- **showNotification(message, type)** - Show a toast notification (type: "success", "error", "info")
+
+### Edit Mode (REQUIRED before creating/updating nodes)
+- **requestEditMode()** - Request edit lock. MUST call this before createNode or updateNodeFields
+- **releaseEditMode()** - Release the edit lock when done editing
+- **checkEditStatus()** - Check if you have edit access
+
+### Project Management
+- **listProjects(searchTerm?, clientId?, sortBy?)** - List projects. sortBy: "updated", "created", "name", "client"
+- **getProjectDetails(projectId?, projectName?)** - Get project info by ID or name search
+- **createProject(name, clientId, description?, templateId?)** - Create new project. Use getClients first for clientId
+- **openProjectByName(projectName)** - Search and navigate to a project by name
+- **getProjectTemplates()** - List available project templates
+- **getClients()** - List available clients for project creation
+
+### Node Information (Read-only)
+- **getProjectHierarchyInfo()** - Get hierarchy levels, coding config, structure info
+- **getNodeChildren(nodeId?)** - Get children of a node (uses selected node if no ID)
+- **getNodeDetails(nodeId?)** - Get detailed info about a node
+- **getNodesByLevel(level?, levelName?, limit?)** - Find all nodes at a hierarchy level
+- **getAvailableTemplates(parentNodeId?)** - Get templates valid for creating under a parent
+- **getNodeTemplateFields(templateId)** - Get field schema with assignment IDs for a template
+- **getNodeFields(nodeId?)** - Read current field values from a node
+
+### Node Creation & Editing (REQUIRES edit mode)
+- **createNode(templateId, title, parentNodeId?, initialFields?)** - Create a node. Use getAvailableTemplates first
+- **updateNodeFields(nodeId?, fieldUpdates)** - Update fields. fieldUpdates: { assignmentId: value }
+
+### Template Exploration
+- **listAllNodeTemplates(projectTemplateId?, nodeType?, limit?)** - Browse all node templates
+- **listFieldTemplates(fieldType?, limit?)** - Browse field templates
+- **getTemplateDetails(templateId, templateType?)** - Get full template details. templateType: "node" or "field"
+
+### Document Management
+- **uploadDocument(category, instructions?)** - Trigger upload dialog. category: "course_content" or "framework_content"
+
+### Media Library (Microverse)
+- **searchMicroverse(query?, fileType?, category?, limit?)** - Search media assets
+- **getMicroverseDetails(fileId)** - Get detailed info about a media asset
+- **getMicroverseUsage(fileId)** - Check where an asset is used
+- **attachMicroverseToNode(nodeId, fileId, fieldAssignmentId)** - Attach media to a node field
+- **detachMicroverseFromNode(nodeId, fileId, fieldAssignmentId)** - Remove media from a node
+
+### Framework & Criteria Mapping
+- **listFrameworks(category?, status?)** - List competency frameworks
+- **getFrameworkDetails(frameworkId)** - Get framework info with items
+- **searchASQAUnits(query, limit?)** - Search ASQA training units
+- **linkFrameworkToProject(frameworkId, projectId)** - Link a framework to project
+- **mapCriteriaToNode(nodeId, criteriaId)** - Map criteria to a node
+- **suggestCriteriaMappings(nodeId)** - Get AI-suggested criteria mappings
+
+### User Interaction (USE THESE - don't just type text!)
+- **askClarifyingQuestions(questions)** - Ask up to 5 questions with options. Format:
+  \`\`\`
+  questions: [
+    { question: "What is the target audience?", options: ["Beginners", "Intermediate", "Advanced"] },
+    { question: "Preferred duration?", options: ["1 hour", "Half day", "Full day"] }
+  ]
+  \`\`\`
+- **offerOptions(title, options, allowMultiple?)** - Present choices to user. Format:
+  \`\`\`
+  title: "How would you like to proceed?"
+  options: [
+    { id: "option1", label: "Create project now", description: "Start immediately" },
+    { id: "option2", label: "Gather more requirements", description: "Ask more questions first" }
+  ]
+  \`\`\`
+- **requestPlanApproval(plan, title?)** - Get user approval for a plan before executing
+- **requestActionApproval(action, reason?)** - Confirm a sensitive action with the user
+
+**IMPORTANT**: When presenting options to the user, ALWAYS use \`offerOptions\` or \`askClarifyingQuestions\` tools.
+Do NOT just write out options as text - the tools provide a better UI experience with clickable buttons.
+
+## When to Use Tools Directly vs Delegate to Specialists
+
+### DO IT YOURSELF (use tools directly):
+- Creating projects
+- Navigating to projects
+- Listing projects, nodes, templates
+- Creating simple nodes (structural, categories)
+- Checking project structure
+- Getting information for the user
+- Any quick, straightforward action
+
+### DELEGATE TO SPECIALISTS (use [ROUTE:x]):
+- **Strategist**: Gathering requirements for a new training project through conversation
+- **Researcher**: Deep research requiring web search, document analysis, RAG
+- **Architect**: Designing complex course structures with learning progressions
+- **Writer**: Creating rich Level 6 content nodes with detailed content
+- **Visual Designer**: Defining visual aesthetics, colors, fonts, tone
 
 ## Decision Making
 
-When a user message arrives, decide:
+When a user message arrives:
 
-1. **Can I handle this directly?** - Simple questions, status updates, clarifications
-2. **Which agent should handle this?** - Complex tasks need specialists
-3. **What context do they need?** - Pass relevant brief/research/structure
-4. **What's the optimal sequence?** - Some agents depend on others' output
+1. **Can I do this directly with a tool?** → Use the tool!
+2. **Does this need specialist knowledge?** → Route to the right sub-agent
+3. **Do I need more information?** → Ask and WAIT for response (no routing!)
+4. **Is this a greeting or general question?** → Respond directly
+
+## CRITICAL: When to Wait vs When to Route
+
+**WAIT for user input** (do NOT route):
+- When you're asking the user a question → USE \`askClarifyingQuestions\` or \`offerOptions\` tool!
+- When you need clarification about what they want → USE tools, don't just type text
+- When greeting the user or introducing yourself
+- When you don't have enough context to delegate a task
+
+**USE TOOLS DIRECTLY**:
+- When you can accomplish the task with available tools
+- For project/node operations, navigation, information retrieval
+- For simple CRUD operations
+
+**ROUTE to sub-agent** (use [ROUTE:x] marker):
+- When you need SPECIALIST expertise (research, writing, design, strategy)
+- When the task requires extended conversation or complex analysis
+- When user has provided enough context for the specialist
 
 ## Guidelines
 
-- Always start new projects with the Strategist
+- Prefer using tools directly over routing to sub-agents when possible
+- **When asking user to choose between options, ALWAYS use offerOptions or askClarifyingQuestions tools** - never just write options as text
+- Always start new training PROJECTS with the Strategist for requirements gathering
 - Research before Architecture
 - Get approval before Writing begins
 - Visual Design can run early in parallel
 - Keep the user informed of progress
 - Summarize agent outputs for the user
 - Don't call multiple agents in one turn - process sequentially
-- If unsure, ask the user for clarification
+- If unsure, ask the user for clarification using the tools (and WAIT for their response)
 
 ## Current Context Summary
 
@@ -303,19 +402,15 @@ async function orchestratorNode(
   console.log("  Current agent:", state.currentAgent);
   console.log("  Agent history:", state.agentHistory?.join(" -> ") || "none");
 
-  // Get frontend tools for the orchestrator
+  // Get ALL frontend tools - orchestrator can perform any frontend action directly
   const frontendActions = state.copilotkit?.actions ?? [];
-  const orchestratorTools = frontendActions.filter((action: { name: string }) =>
-    [
-      "requestPlanApproval",
-      "requestActionApproval",
-      "offerOptions",
-      "getProjectHierarchyInfo",
-      "getNodeChildren",
-    ].includes(action.name)
-  );
+  
+  // Orchestrator has access to ALL frontend tools for direct actions
+  // Only routes to sub-agents for specialist work (research, content writing, etc.)
+  const orchestratorTools = frontendActions;
 
   console.log("  Available tools:", orchestratorTools.map((t: { name: string }) => t.name).join(", ") || "none");
+  console.log("  Total frontend tools:", orchestratorTools.length);
 
   // Build dynamic system prompt with context
   let systemContent = ORCHESTRATOR_SYSTEM_PROMPT;
@@ -369,25 +464,70 @@ Consider starting with the Strategist to gather requirements.`;
   // Add routing instructions
   systemContent += `\n\n## Routing Instructions
 
-To delegate to a sub-agent, respond with a clear routing directive in your message:
-- "I'll have the Strategist gather requirements..."
-- "Let me ask the Researcher to look into..."
-- "The Architect should design..."
-- "The Writer will create..."
-- "Let's have the Visual Designer propose..."
+**IMPORTANT**: You must be EXPLICIT when routing to sub-agents vs asking the user questions.
 
-The system will detect these and route accordingly.`;
+### When asking the user a question (waiting for their input):
+- Simply ask your question
+- Do NOT mention routing or delegating
+- The system will wait for user input automatically
+- Example: "What topic would you like to create training content about?"
 
-  const systemMessage = new SystemMessage({ content: systemContent });
+### When delegating to a sub-agent (after you have enough info):
+- Use EXPLICIT routing phrases that make it clear you're delegating NOW
+- Include the marker [ROUTE:agent_name] in your response
+- Examples:
+  - "Now that I understand your needs, [ROUTE:strategist] I'm routing to the Strategist to gather detailed requirements."
+  - "[ROUTE:researcher] Let me have the Researcher look into this topic."
+  - "[ROUTE:architect] I'm delegating to the Architect to design the course structure."
+
+### Available route markers:
+- [ROUTE:strategist] - For requirements gathering
+- [ROUTE:researcher] - For knowledge gathering  
+- [ROUTE:architect] - For course structure design
+- [ROUTE:writer] - For content creation
+- [ROUTE:visual_designer] - For design and aesthetics
+
+**Key rule**: If you're asking the user something, DON'T include a route marker. Only include [ROUTE:x] when you're ready to hand off work.`;
+
+  // Create system message with prompt caching
+  // The static base prompt is cached (ephemeral cache for ~5 min) to reduce costs
+  // Dynamic context is appended without caching
+  const systemMessage = new SystemMessage({
+    content: [
+      {
+        type: "text",
+        text: ORCHESTRATOR_SYSTEM_PROMPT,
+        // Cache the static system prompt for repeated calls
+        // This reduces costs by ~10x for the cached portion
+        cache_control: { type: "ephemeral" },
+      },
+      {
+        type: "text",
+        // Dynamic context that changes per invocation (not cached)
+        text: systemContent.replace(ORCHESTRATOR_SYSTEM_PROMPT, ""),
+      },
+    ],
+  });
 
   // Bind tools and invoke
   const modelWithTools = orchestratorTools.length > 0
     ? orchestratorModel.bindTools(orchestratorTools)
     : orchestratorModel;
 
-  // Prepare messages
-  const filteredMessages = filterOrphanedToolResults(state.messages || []);
-  const trimmedMessages = trimMessages(filteredMessages, 40);
+  // Prepare messages with full context management pipeline:
+  // 1. Summarize old messages if context is getting large
+  // 2. Trim to token/message limits
+  // 3. Filter orphaned tool results
+  const summarizedMessages = await summarizeIfNeeded(state.messages || [], {
+    triggerTokens: TOKEN_LIMITS.orchestrator,
+    keepMessages: 20,
+    logPrefix: "[orchestrator]",
+  });
+  const trimmedMessages = await trimMessages(summarizedMessages, {
+    fallbackMessageCount: MESSAGE_LIMITS.orchestrator,
+    logPrefix: "[orchestrator]",
+  });
+  const filteredMessages = filterOrphanedToolResults(trimmedMessages, "[orchestrator]");
 
   const customConfig = copilotkitCustomizeConfig(config, {
     emitToolCalls: true,
@@ -396,27 +536,13 @@ The system will detect these and route accordingly.`;
   console.log("  Invoking orchestrator model...");
 
   const response = await modelWithTools.invoke(
-    [systemMessage, ...trimmedMessages],
+    [systemMessage, ...filteredMessages],
     customConfig
   );
 
   console.log("  Orchestrator response received");
 
-  // Log thinking and response
   const aiResponse = response as AIMessage;
-  if (aiResponse.content && Array.isArray(aiResponse.content)) {
-    for (const block of aiResponse.content) {
-      if (typeof block === "object" && block !== null) {
-        if ("type" in block && block.type === "thinking") {
-          console.log("\n  [THINKING] ================================");
-          const thinking = ((block as any).thinking || "").substring(0, 500);
-          console.log("  " + thinking + (thinking.length >= 500 ? "..." : ""));
-          console.log("  [/THINKING] ===============================\n");
-        }
-      }
-    }
-  }
-
   if (aiResponse.tool_calls?.length) {
     console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
   }
@@ -436,38 +562,99 @@ The system will detect these and route accordingly.`;
     console.log(`  Detected routing to: ${routingDecision.nextAgent}`);
   }
 
+  // Check for pending async user actions (e.g., document upload)
+  // This prevents premature routing when the user is in the middle of uploading
+  const pendingUpload = detectPendingUpload([...filteredMessages, response]);
+  const awaitingUserAction = pendingUpload || null;
+  
+  if (awaitingUserAction) {
+    console.log(`  Setting awaitingUserAction: ${awaitingUserAction}`);
+  } else if (state.awaitingUserAction) {
+    console.log(`  Clearing awaitingUserAction (was: ${state.awaitingUserAction})`);
+  }
+
   return {
     messages: [response],
     currentAgent: "orchestrator",
     routingDecision,
+    awaitingUserAction,
   };
 }
 
 // ============================================================================
-// ROUTING DETECTION
+// ROUTING DETECTION - Only detect EXPLICIT routing commands
 // ============================================================================
 
+/**
+ * Detects explicit routing directives in text.
+ * 
+ * IMPORTANT: Only routes when the orchestrator explicitly indicates it's delegating NOW.
+ * Does NOT route for:
+ * - Questions to the user (waiting for input)
+ * - Explanations of what agents can do
+ * - Future/conditional statements ("I could ask the strategist...")
+ * 
+ * Only routes for:
+ * - Explicit present-tense delegation: "I'm routing to", "Delegating to", "Handing off to"
+ * - Active action statements: "I'll now have the strategist...", "Let me get the researcher..."
+ */
 function detectRoutingDirective(text: string): { nextAgent: AgentType; reason: string; task: string } | null {
   const lower = text.toLowerCase();
-
-  if (lower.includes("strategist") && (lower.includes("gather") || lower.includes("ask") || lower.includes("discover") || lower.includes("clarify"))) {
-    return { nextAgent: "strategist", reason: "Strategy/requirements gathering needed", task: text };
+  
+  // First, check if this is a question to the user - if so, DON'T route
+  const isQuestion = lower.includes("what would you like") ||
+    lower.includes("tell me about") ||
+    lower.includes("what are you working on") ||
+    lower.includes("could you tell me") ||
+    lower.includes("what do you need") ||
+    lower.includes("how can i help") ||
+    lower.includes("let me know") ||
+    lower.includes("?");
+  
+  if (isQuestion) {
+    // If it's a question, only route if there's ALSO an explicit "routing now" phrase
+    const hasExplicitRouting = 
+      lower.includes("i'm routing to") ||
+      lower.includes("delegating to") ||
+      lower.includes("handing off to") ||
+      lower.includes("transferring to");
+    
+    if (!hasExplicitRouting) {
+      return null; // It's a question without explicit routing - wait for user
+    }
   }
 
-  if (lower.includes("researcher") && (lower.includes("research") || lower.includes("look into") || lower.includes("investigate") || lower.includes("search"))) {
-    return { nextAgent: "researcher", reason: "Research/knowledge gathering needed", task: text };
-  }
+  // Look for EXPLICIT routing phrases (present tense, active delegation)
+  const explicitRoutingPhrases = [
+    /i(?:'m| am) (?:now )?(?:routing|delegating|handing off|transferring) to (?:the )?(\w+)/i,
+    /let me (?:now )?(?:get|have|ask) (?:the )?(\w+) (?:agent )?to/i,
+    /i(?:'ll| will) (?:now )?have (?:the )?(\w+) (?:agent )?(?:start|begin|handle|take over)/i,
+    /(?:routing|delegating|handing off) (?:this )?to (?:the )?(\w+)/i,
+    /\[ROUTE:(\w+)\]/i, // Explicit routing tag
+  ];
 
-  if (lower.includes("architect") && (lower.includes("design") || lower.includes("structure") || lower.includes("plan") || lower.includes("organize"))) {
-    return { nextAgent: "architect", reason: "Course structure design needed", task: text };
-  }
-
-  if (lower.includes("writer") && (lower.includes("write") || lower.includes("create") || lower.includes("content"))) {
-    return { nextAgent: "writer", reason: "Content creation needed", task: text };
-  }
-
-  if (lower.includes("visual designer") && (lower.includes("design") || lower.includes("style") || lower.includes("theme") || lower.includes("color"))) {
-    return { nextAgent: "visual_designer", reason: "Visual design needed", task: text };
+  for (const pattern of explicitRoutingPhrases) {
+    const match = lower.match(pattern);
+    if (match) {
+      const agentName = match[1].toLowerCase();
+      
+      // Map to agent type
+      if (agentName.includes("strategist") || agentName === "strategist") {
+        return { nextAgent: "strategist", reason: "Explicit routing to strategist", task: text };
+      }
+      if (agentName.includes("researcher") || agentName === "researcher") {
+        return { nextAgent: "researcher", reason: "Explicit routing to researcher", task: text };
+      }
+      if (agentName.includes("architect") || agentName === "architect") {
+        return { nextAgent: "architect", reason: "Explicit routing to architect", task: text };
+      }
+      if (agentName.includes("writer") || agentName === "writer") {
+        return { nextAgent: "writer", reason: "Explicit routing to writer", task: text };
+      }
+      if (agentName.includes("visual") || agentName.includes("designer")) {
+        return { nextAgent: "visual_designer", reason: "Explicit routing to visual designer", task: text };
+      }
+    }
   }
 
   return null;
@@ -484,6 +671,14 @@ function routeFromOrchestrator(state: OrchestratorState): NodeName {
 
   const messages = state.messages;
   const lastMessage = messages[messages.length - 1] as AIMessage;
+
+  // Check if we're waiting for async user action (e.g., document upload)
+  // If so, don't route to sub-agents - wait for the user action to complete
+  if (state.awaitingUserAction) {
+    console.log(`  Awaiting user action: ${state.awaitingUserAction}`);
+    console.log("  -> Route to __end__ (waiting for user action)");
+    return "__end__";
+  }
 
   // Check for tool calls
   if (lastMessage.tool_calls?.length) {
@@ -525,6 +720,13 @@ function routeFromSubAgent(state: OrchestratorState): NodeName {
   const messages = state.messages;
   const lastMessage = messages[messages.length - 1] as AIMessage;
 
+  // Check if we're waiting for async user action (e.g., document upload)
+  if (state.awaitingUserAction) {
+    console.log(`  Awaiting user action: ${state.awaitingUserAction}`);
+    console.log("  -> Route to __end__ (waiting for user action)");
+    return "__end__";
+  }
+
   // Check for tool calls
   if (lastMessage.tool_calls?.length) {
     const toolNames = lastMessage.tool_calls.map((tc) => tc.name);
@@ -539,14 +741,41 @@ function routeFromSubAgent(state: OrchestratorState): NodeName {
       return "execute_backend_tools";
     }
 
-    // Frontend tools route to END
+    // Check if uploadDocument is being called - will need to wait for async upload
+    const hasUploadDocument = toolNames.includes("uploadDocument");
+    if (hasUploadDocument) {
+      console.log("  uploadDocument called - will wait for user to upload");
+    }
+
+    // Frontend tools route to END for CopilotKit to handle
     console.log("  -> Route to __end__ (frontend tools)");
     return "__end__";
   }
 
-  // No tool calls - return to orchestrator
-  console.log("  -> Route to orchestrator");
-  return "orchestrator";
+  // No tool calls - check for explicit handoff marker
+  const responseText = typeof lastMessage.content === "string"
+    ? lastMessage.content
+    : Array.isArray(lastMessage.content)
+    ? lastMessage.content
+        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    : "";
+
+  // ONLY route back to orchestrator if explicitly indicated with markers
+  const handingBack = responseText.toLowerCase().includes("[handoff:orchestrator]") ||
+    responseText.toLowerCase().includes("[done]");
+
+  if (handingBack) {
+    console.log("  -> Route to orchestrator (explicit handoff)");
+    return "orchestrator";
+  }
+
+  // DEFAULT: Route to __end__ and wait for user input
+  // This prevents loops when sub-agents return thinking-only or empty responses
+  // The next user message will trigger the graph to continue
+  console.log("  -> Route to __end__ (waiting for user input)");
+  return "__end__";
 }
 
 function routeAfterToolExecution(state: OrchestratorState): NodeName {

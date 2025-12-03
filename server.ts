@@ -341,12 +341,18 @@ app.use('/copilotkit', (req, res, next) => {
 - Architect: Designs course structure
 - Writer: Creates Level 6 content nodes
 - Visual Designer: Defines aesthetics and tone`,
+        config: {
+          recursion_limit: 100,
+        },
       }),
       // Legacy node_expert kept for backwards compatibility
       'node_expert': new LangGraphAgent({
         deploymentUrl: 'http://localhost:8000',
         graphId: 'node_expert',
         description: `Legacy agent for creating nodes directly (use orchestrator for full workflow)`,
+        config: {
+          recursion_limit: 100,
+        },
       })
     },
     middleware: {

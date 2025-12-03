@@ -71,53 +71,96 @@ function hasNonEmptyTextContent(msg: AIMessage): boolean {
 }
 
 /**
- * Filters out:
- * 1. Orphaned tool_result messages that don't have matching tool_use blocks
- * 2. AI messages with empty text content (only thinking blocks)
+ * Filters out orphaned messages to prevent Anthropic API errors:
+ * - tool_result without matching tool_use
+ * - AI messages with ONLY unresolved tool_calls and no text content
  * 
- * Anthropic requires:
- * - Each tool_result to have a corresponding tool_use in the previous AI message
- * - Text content blocks to be non-empty
+ * IMPORTANT: When an AI message has SOME resolved and SOME unresolved tool_calls,
+ * we create a NEW AI message with only the resolved ones to preserve the tool_use
+ * for existing tool_results.
  */
 function filterOrphanedToolResults(messages: BaseMessage[]): BaseMessage[] {
   const filtered: BaseMessage[] = [];
+  
+  // First pass: collect all tool_result IDs
+  const toolResultIds = new Set<string>();
+  for (const msg of messages) {
+    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || '';
+    if (msgType === 'tool' || msgType === 'ToolMessage') {
+      toolResultIds.add((msg as ToolMessage).tool_call_id);
+    }
+  }
   
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || '';
     
-    // Filter AI messages with empty content
-    if (msgType === 'ai' || msgType === 'AIMessage') {
+    // Handle AI messages
+    if (msgType === 'ai' || msgType === 'AIMessage' || msgType === 'AIMessageChunk') {
       const aiMsg = msg as AIMessage;
-      if (!hasNonEmptyTextContent(aiMsg)) {
-        console.log(`  [FILTER] Removing AI message with empty text content`);
-        continue; // Skip empty AI messages
+      
+      // Check for tool_calls that need filtering
+      if (aiMsg.tool_calls?.length) {
+        const resolvedToolCalls = aiMsg.tool_calls.filter(tc => tc.id && toolResultIds.has(tc.id));
+        const unresolvedToolCalls = aiMsg.tool_calls.filter(tc => tc.id && !toolResultIds.has(tc.id));
+        
+        if (unresolvedToolCalls.length > 0) {
+          console.log(`  [FILTER] Found ${unresolvedToolCalls.length} unresolved tool_calls: ${unresolvedToolCalls.map(tc => tc.name).join(', ')}`);
+        }
+        
+        // If we have resolved tool_calls, create a new AI message with only those
+        if (resolvedToolCalls.length > 0) {
+          if (unresolvedToolCalls.length > 0) {
+            const newAiMsg = new AIMessage({
+              content: aiMsg.content,
+              tool_calls: resolvedToolCalls,
+              id: aiMsg.id,
+              name: aiMsg.name,
+              additional_kwargs: { ...aiMsg.additional_kwargs },
+              response_metadata: aiMsg.response_metadata,
+            });
+            filtered.push(newAiMsg);
+            console.log(`  [FILTER] Kept AI message with ${resolvedToolCalls.length} resolved tool_calls`);
+          } else {
+            filtered.push(msg);
+          }
+          continue;
+        }
       }
+      
+      // No resolved tool_calls - check for text content
+      if (!hasNonEmptyTextContent(aiMsg)) {
+        console.log(`  [FILTER] Removing AI message with no content and no resolved tool_calls`);
+        continue;
+      }
+      filtered.push(msg);
+      continue;
     }
     
-    // If this is a tool message, check if the previous AI message has the matching tool_use
+    // Handle tool messages - check for orphaned tool_results
     if (msgType === 'tool' || msgType === 'ToolMessage') {
       const toolMsg = msg as ToolMessage;
       const toolCallId = toolMsg.tool_call_id;
       
-      // Look back for the previous AI message
+      // Search ALL previous AI messages for matching tool_use
       let hasMatchingToolUse = false;
       for (let j = filtered.length - 1; j >= 0; j--) {
         const prevMsg = filtered[j];
         const prevType = (prevMsg as any)._getType?.() || (prevMsg as any).constructor?.name || '';
         
-        if (prevType === 'ai' || prevType === 'AIMessage') {
+        if (prevType === 'ai' || prevType === 'AIMessage' || prevType === 'AIMessageChunk') {
           const aiMsg = prevMsg as AIMessage;
           if (aiMsg.tool_calls?.some(tc => tc.id === toolCallId)) {
             hasMatchingToolUse = true;
+            break; // Found matching tool_use, stop searching
           }
-          break; // Only check the most recent AI message
+          // Continue searching older AI messages (don't break here)
         }
       }
       
       if (!hasMatchingToolUse) {
         console.log(`  [FILTER] Removing orphaned tool result: ${toolCallId}`);
-        continue; // Skip this orphaned tool result
+        continue;
       }
     }
     
@@ -183,12 +226,8 @@ export type NodeExpertState = typeof NodeExpertStateAnnotation.State;
  */
 const model = new ChatAnthropic({
   model: "claude-opus-4-5-20251101",
-  maxTokens: 32000, // Increased: budget_tokens (10000) + response needs (~22000 for long reports)
-  thinking: {
-    type: "enabled",
-    budget_tokens: 10000,
-  },
-  temperature: 1, // Required for extended thinking
+  maxTokens: 16000,
+  temperature: 0.7,
 });
 
 // ============================================================================
@@ -995,7 +1034,7 @@ No nodes created yet. If the user is asking you to create content:
 
   console.log('  Invoking model with', allTools.length, 'tools (', frontendTools.length, 'frontend,', backendTools.length, 'backend)...');
 
-  // Filter out orphaned tool results to prevent Anthropic API errors
+  // Filter out orphaned tool results (keep thinking blocks since thinking is enabled)
   const filteredMessages = filterOrphanedToolResults(state.messages || []);
   console.log(`  Messages: ${state.messages?.length ?? 0} -> ${filteredMessages.length} after filtering`);
 
@@ -1016,28 +1055,7 @@ No nodes created yet. If the user is asking you to create content:
 
   console.log('  Model response received');
   
-  // Log extended thinking if present
   const aiResponse = response as AIMessage;
-  if (aiResponse.content && Array.isArray(aiResponse.content)) {
-    for (const block of aiResponse.content) {
-      if (typeof block === 'object' && block !== null) {
-        if ('type' in block && block.type === 'thinking') {
-          console.log('\n  [EXTENDED THINKING] ================================');
-          console.log('  ' + ((block as any).thinking || '').split('\n').join('\n  '));
-          console.log('  [/EXTENDED THINKING] ===============================\n');
-        } else if ('type' in block && block.type === 'text') {
-          const textContent = (block as any).text || '';
-          console.log('  [TEXT RESPONSE]:', textContent.length > 2000 
-            ? textContent.substring(0, 2000) + `... [truncated, ${textContent.length} total chars]`
-            : textContent);
-        }
-      }
-    }
-  } else if (typeof aiResponse.content === 'string') {
-    console.log('  [TEXT RESPONSE]:', aiResponse.content.length > 2000 
-      ? aiResponse.content.substring(0, 2000) + `... [truncated, ${aiResponse.content.length} total chars]`
-      : aiResponse.content);
-  }
   
   // Log tool calls with full arguments
   console.log('  Has tool calls?', !!aiResponse.tool_calls?.length);

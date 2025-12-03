@@ -271,7 +271,19 @@ export const OrchestratorStateAnnotation = Annotation.Root({
 
   /** Current routing decision */
   routingDecision: Annotation<RoutingDecision | null>({
-    reducer: (existing, update) => update ?? existing,
+    // FIX: Use update directly so null actually clears the value
+    // Previously `update ?? existing` would keep old value when update was null
+    reducer: (existing, update) => update === undefined ? existing : update,
+    default: () => null,
+  }),
+
+  /** 
+   * Tracks when the agent is waiting for async user action (e.g., file upload).
+   * Prevents premature graph re-entry during async operations.
+   * Set to a string describing the action (e.g., "document_upload"), cleared with null.
+   */
+  awaitingUserAction: Annotation<string | null>({
+    reducer: (existing, update) => update === undefined ? existing : update,
     default: () => null,
   }),
 

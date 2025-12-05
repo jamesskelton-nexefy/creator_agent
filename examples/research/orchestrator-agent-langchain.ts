@@ -13,11 +13,13 @@
  */
 
 import "dotenv/config";
-import { createAgent, createMiddleware } from "langchain";
+import { createAgent } from "langchain";
 import { SystemMessage } from "@langchain/core/messages";
 import { RunnableConfig } from "@langchain/core/runnables";
 import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
+import { DynamicStructuredTool } from "@langchain/core/tools";
+import { convertJsonSchemaToZodSchema } from "@copilotkit/shared";
 import { CopilotKitStateAnnotation } from "@copilotkit/sdk-js/langgraph";
 import { copilotkitCustomizeConfig, copilotKitInterrupt } from "@copilotkit/sdk-js/langgraph";
 
@@ -36,6 +38,45 @@ const OrchestratorLangchainStateAnnotation = Annotation.Root({
 });
 
 export type OrchestratorLangchainState = typeof OrchestratorLangchainStateAnnotation.State;
+
+// ============================================================================
+// TOOL CONVERSION - Convert CopilotKit actions to tools that use interrupt
+// ============================================================================
+
+/**
+ * Converts a CopilotKit action to a DynamicStructuredTool that triggers
+ * copilotKitInterrupt when called. This allows the agent to pause and let
+ * CopilotKit execute the frontend action in the browser.
+ */
+function convertActionToInterruptingTool(actionInput: any): DynamicStructuredTool<any> {
+  const action = actionInput.type === "function" ? actionInput.function : actionInput;
+  
+  return new DynamicStructuredTool({
+    name: action.name,
+    description: action.description || "",
+    schema: convertJsonSchemaToZodSchema(action.parameters, true),
+    func: async (args: Record<string, any>) => {
+      console.log(`\n[tool:${action.name}] Triggering copilotKitInterrupt with args:`, JSON.stringify(args, null, 2));
+      
+      // Use copilotKitInterrupt to pause the graph and let CopilotKit execute this tool
+      // in the browser. The graph will resume with the result from the frontend.
+      const { answer } = copilotKitInterrupt({
+        action: action.name,
+        args: args,
+      });
+      
+      console.log(`[tool:${action.name}] Resumed from interrupt with answer:`, answer);
+      return answer ?? "";
+    },
+  });
+}
+
+/**
+ * Converts all CopilotKit actions to tools that use copilotKitInterrupt.
+ */
+function convertActionsToInterruptingTools(actions: any[]): DynamicStructuredTool<any>[] {
+  return actions.map(action => convertActionToInterruptingTool(action));
+}
 
 // ============================================================================
 // SYSTEM PROMPT
@@ -142,58 +183,26 @@ async function orchestratorNode(
   console.log("\n[orchestrator-langchain] ============ Agent Node ============");
   console.log("  Messages count:", state.messages?.length ?? 0);
 
-  // Get frontend tools from CopilotKit state
+  // Get frontend actions from CopilotKit state
   const frontendActions = state.copilotkit?.actions ?? [];
-  console.log("  Available frontend tools:", frontendActions.length);
+  console.log("  Available frontend actions:", frontendActions.length);
   
-  // Build a set of frontend tool names for quick lookup
-  const frontendToolNames = new Set(
-    frontendActions.map((t: { name: string }) => t.name)
-  );
-  console.log("  Tool names:", Array.from(frontendToolNames).join(", ") || "none");
+  // Convert CopilotKit actions to tools that trigger copilotKitInterrupt
+  // This is the key: each tool's func() calls copilotKitInterrupt to pause
+  // the graph and let the frontend execute the action
+  const interruptingTools = convertActionsToInterruptingTools(frontendActions);
+  console.log("  Converted to interrupting tools:", interruptingTools.map(t => t.name).join(", ") || "none");
 
   // Customize config to emit tool calls for CopilotKit
   const customConfig = copilotkitCustomizeConfig(config, {
     emitToolCalls: true,
   });
 
-  // Create middleware to intercept frontend tool calls and use copilotKitInterrupt
-  const frontendToolMiddleware = createMiddleware({
-    name: "FrontendToolInterrupt",
-    wrapToolCall: async (request, handler) => {
-      const toolName = request.toolCall.name;
-      const toolArgs = request.toolCall.args;
-      
-      // Check if this is a frontend tool (all CopilotKit actions are frontend tools)
-      if (frontendToolNames.has(toolName)) {
-        console.log(`\n[middleware] Frontend tool detected: ${toolName}`);
-        console.log(`[middleware] Args:`, JSON.stringify(toolArgs, null, 2));
-        console.log(`[middleware] Using copilotKitInterrupt for CopilotKit to execute...`);
-        
-        // Use copilotKitInterrupt to pause the graph with the proper CopilotKit format
-        // CopilotKit will receive the tool call, execute it in the browser,
-        // and resume the graph with the result
-        const { answer } = copilotKitInterrupt({
-          action: toolName,
-          args: toolArgs as Record<string, any>,
-        });
-        
-        console.log(`[middleware] Resumed from interrupt with answer:`, answer);
-        
-        // Return the answer from the interrupt (CopilotKit provides this when resuming)
-        return answer;
-      }
-      
-      // For non-frontend tools, execute normally via the handler
-      console.log(`[middleware] Server tool: ${toolName}, executing normally`);
-      return await handler(request);
-    },
-  });
-
-  // Create the agent using LangChain's createAgent with middleware array
+  // Create the agent using LangChain's createAgent
+  // Tools will trigger copilotKitInterrupt when called
   const agent = createAgent({
     model: "anthropic:claude-sonnet-4-20250514",
-    tools: frontendActions,
+    tools: interruptingTools,
     systemPrompt: new SystemMessage({
       content: [
         {
@@ -204,8 +213,6 @@ async function orchestratorNode(
         },
       ],
     }),
-    // Middleware must be an array
-    middleware: [frontendToolMiddleware],
   });
 
   console.log("  Invoking createAgent with frontend tool middleware...");

@@ -306,9 +306,29 @@ console.log('    POST /api/documents/search');
 // COPILOTKIT RUNTIME
 // ============================================================================
 
+// ============================================================================
+// LANGGRAPH DEPLOYMENT CONFIGURATION
+// ============================================================================
+// Set USE_LOCAL_LANGGRAPH=true to use local langgraph server (localhost:8000)
+// Otherwise uses LangSmith Cloud deployment
+const USE_LOCAL_LANGGRAPH = process.env.USE_LOCAL_LANGGRAPH === 'true';
+const LANGGRAPH_CLOUD_URL = 'https://creatoragentcloud-9617e637415c5949bf1f5028e5c0361c.us.langgraph.app';
+const LANGGRAPH_LOCAL_URL = 'http://localhost:8000';
+const LANGGRAPH_URL = USE_LOCAL_LANGGRAPH ? LANGGRAPH_LOCAL_URL : LANGGRAPH_CLOUD_URL;
+
+// LangSmith API key required for cloud deployment
+const LANGSMITH_API_KEY = process.env.LANGSMITH_API_KEY;
+if (!USE_LOCAL_LANGGRAPH && !LANGSMITH_API_KEY) {
+  console.warn('[WARNING] LANGSMITH_API_KEY not set - cloud deployment may fail authentication');
+}
+
+// Select which orchestrator to use: 'orchestrator' (LangGraph) or 'orchestrator_langchain' (createAgent)
+const ORCHESTRATOR_AGENT = process.env.ORCHESTRATOR_AGENT || 'orchestrator';
+
 console.log('[√] Configuring CopilotKit agents...');
-console.log('    [AGENT LOCK MODE] Locked to: orchestrator');
-console.log('    Agent: orchestrator @ http://localhost:8000/orchestrator');
+console.log(`    [AGENT LOCK MODE] Locked to: ${ORCHESTRATOR_AGENT}`);
+console.log(`    Mode: ${USE_LOCAL_LANGGRAPH ? 'LOCAL' : 'CLOUD'}`);
+console.log(`    Agent: ${ORCHESTRATOR_AGENT} @ ${LANGGRAPH_URL}`);
 
 app.use('/copilotkit', (req, res, next) => {
   // ============================================================================
@@ -329,10 +349,11 @@ app.use('/copilotkit', (req, res, next) => {
     // - Writer: Content creation
     // - Visual Designer: Aesthetics and tone
     // =========================================================================
-    agentLock: 'orchestrator',
+    agentLock: ORCHESTRATOR_AGENT,
     agents: {
       'orchestrator': new LangGraphAgent({
-        deploymentUrl: 'http://localhost:8000',
+        deploymentUrl: LANGGRAPH_URL,
+        langsmithApiKey: LANGSMITH_API_KEY,
         graphId: 'orchestrator',
         description: `Multi-agent orchestrator for creating impactful online training:
 - Coordinates specialized sub-agents for different tasks
@@ -348,16 +369,20 @@ app.use('/copilotkit', (req, res, next) => {
           recursionLimit: 150,
         },
       }),
-      // Legacy node_expert kept for backwards compatibility
-      'node_expert': new LangGraphAgent({
-        deploymentUrl: 'http://localhost:8000',
-        graphId: 'node_expert',
-        description: `Legacy agent for creating nodes directly (use orchestrator for full workflow)`,
+      'orchestrator_langchain': new LangGraphAgent({
+        deploymentUrl: LANGGRAPH_URL,
+        langsmithApiKey: LANGSMITH_API_KEY,
+        graphId: 'orchestrator_langchain',
+        description: `LangChain createAgent orchestrator - a simpler agent implementation:
+- Uses LangChain v1 createAgent pattern
+- Standard ReAct agent loop with automatic tool handling
+- Access to all frontend tools for project/node management
+- May provide more stable tool handling than custom LangGraph`,
         config: {
           recursion_limit: 150,
           recursionLimit: 150,
         },
-      })
+      }),
     },
     middleware: {
       onBeforeRequest: (options) => {
@@ -421,9 +446,15 @@ app.listen(4000, () => {
   console.log('[√] CopilotKit Runtime Server Started');
   console.log('='.repeat(60));
   console.log('  URL: http://localhost:4000/copilotkit');
-  console.log('  Agent: orchestrator (multi-agent system)');
-  console.log('  Sub-agents: strategist, researcher, architect, writer, visual_designer');
-  console.log('  LangGraph: http://localhost:8000');
+  console.log(`  Active Agent: ${ORCHESTRATOR_AGENT}`);
+  if (ORCHESTRATOR_AGENT === 'orchestrator') {
+    console.log('  Sub-agents: strategist, researcher, architect, writer, visual_designer');
+  } else {
+    console.log('  Mode: LangChain createAgent (simpler ReAct loop)');
+  }
+  console.log(`  LangGraph: ${LANGGRAPH_URL}`);
+  console.log(`  Mode: ${USE_LOCAL_LANGGRAPH ? 'LOCAL' : 'LANGSMITH CLOUD'}`);
   console.log('  Model: claude-sonnet-4-20250514');
+  console.log('  [TIP] Set ORCHESTRATOR_AGENT=orchestrator_langchain to use createAgent version');
   console.log('='.repeat(60) + '\n');
 });

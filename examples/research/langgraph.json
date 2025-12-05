@@ -2,7 +2,8 @@
   "$comment": "Multi-agent orchestrator system with specialized sub-agents",
   "dependencies": ["."],
   "graphs": {
-    "orchestrator": "./orchestrator-agent.ts:agent"
+    "orchestrator": "./orchestrator-agent.ts:agent",
+    "orchestrator_langchain": "./orchestrator-agent-langchain.ts:agent"
   },
   "env": ".env"
 }

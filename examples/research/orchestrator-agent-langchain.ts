@@ -9,6 +9,7 @@
  * - Uses createAgent from langchain v1 (built on LangGraph internally)
  * - Has access to all frontend tools via CopilotKit state
  * - Provides a simpler, more standard agent loop
+ * - Uses interrupt() for frontend tools so CopilotKit can execute them
  */
 
 import "dotenv/config";
@@ -18,7 +19,8 @@ import { RunnableConfig } from "@langchain/core/runnables";
 import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { CopilotKitStateAnnotation } from "@copilotkit/sdk-js/langgraph";
-import { copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
+import { copilotkitCustomizeConfig, copilotKitInterrupt } from "@copilotkit/sdk-js/langgraph";
+import type { StructuredToolInterface } from "@langchain/core/tools";
 
 // ============================================================================
 // STATE DEFINITION
@@ -144,15 +146,20 @@ async function orchestratorNode(
   // Get frontend tools from CopilotKit state
   const frontendActions = state.copilotkit?.actions ?? [];
   console.log("  Available frontend tools:", frontendActions.length);
-  console.log("  Tool names:", frontendActions.map((t: { name: string }) => t.name).join(", ") || "none");
+  
+  // Build a set of frontend tool names for quick lookup
+  const frontendToolNames = new Set(
+    frontendActions.map((t: { name: string }) => t.name)
+  );
+  console.log("  Tool names:", Array.from(frontendToolNames).join(", ") || "none");
 
   // Customize config to emit tool calls for CopilotKit
   const customConfig = copilotkitCustomizeConfig(config, {
     emitToolCalls: true,
   });
 
-  // Create the agent using LangChain's createAgent
-  // This uses the model string format for automatic model selection
+  // Create the agent using LangChain's createAgent with middleware
+  // that intercepts frontend tool calls and uses interrupt()
   const agent = createAgent({
     model: "anthropic:claude-sonnet-4-20250514",
     tools: frontendActions,
@@ -166,9 +173,39 @@ async function orchestratorNode(
         },
       ],
     }),
+    // Middleware to intercept frontend tool calls
+    middleware: {
+      wrapToolCall: async (tool: StructuredToolInterface, args: Record<string, unknown>, runConfig: RunnableConfig) => {
+        const toolName = tool.name;
+        
+        // Check if this is a frontend tool (all CopilotKit actions are frontend tools)
+        if (frontendToolNames.has(toolName)) {
+          console.log(`\n[middleware] Frontend tool detected: ${toolName}`);
+          console.log(`[middleware] Args:`, JSON.stringify(args, null, 2));
+          console.log(`[middleware] Using copilotKitInterrupt for CopilotKit to execute...`);
+          
+          // Use copilotKitInterrupt to pause the graph with the proper CopilotKit format
+          // CopilotKit will receive the tool call, execute it in the browser,
+          // and resume the graph with the result
+          const { answer } = copilotKitInterrupt({
+            action: toolName,
+            args: args as Record<string, any>,
+          });
+          
+          console.log(`[middleware] Resumed from interrupt with answer:`, answer);
+          
+          // Return the answer from the interrupt (CopilotKit provides this when resuming)
+          return answer;
+        }
+        
+        // For non-frontend tools, execute normally
+        console.log(`[middleware] Server tool: ${toolName}, executing normally`);
+        return await tool.invoke(args, runConfig);
+      },
+    },
   });
 
-  console.log("  Invoking createAgent...");
+  console.log("  Invoking createAgent with frontend tool middleware...");
 
   try {
     // Invoke the agent with the current messages

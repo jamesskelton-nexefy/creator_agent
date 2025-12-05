@@ -1,50 +1,36 @@
 /**
- * Orchestrator Agent - LangChain createAgent Version
+ * Orchestrator Agent - LangChain Simple Pattern
  *
- * A simpler orchestrator using LangChain's standard createAgent approach
- * instead of manual LangGraph state management.
- *
- * This agent:
- * - Uses createAgent from langchain v1 (built on LangGraph internally)
- * - Has access to all frontend tools via CopilotKit state
- * - CopilotKitStateAnnotation handles frontend tool execution automatically
+ * Uses model.bindTools() with StateGraph (not createAgent).
+ * CopilotKit handles frontend tool execution naturally via tool_calls routing.
+ * 
+ * Flow:
+ * 1. Model receives tools from CopilotKit state
+ * 2. Model generates response (text or tool_calls)
+ * 3. If tool_calls → route to END → CopilotKit executes client-side
+ * 4. CopilotKit resumes with tool results
  */
 
 import "dotenv/config";
-import { createAgent } from "langchain";
+import { ChatAnthropic } from "@langchain/anthropic";
 import { RunnableConfig } from "@langchain/core/runnables";
-import { StateGraph, START, END, Annotation, MemorySaver } from "@langchain/langgraph";
+import { AIMessage, BaseMessage } from "@langchain/core/messages";
+import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { 
   CopilotKitStateAnnotation, 
-  convertActionsToDynamicStructuredTools, 
   copilotkitCustomizeConfig
 } from "@copilotkit/sdk-js/langgraph";
 
 // ============================================================================
-// STATE DEFINITION - CopilotKitStateAnnotation handles frontend tools!
+// STATE DEFINITION
 // ============================================================================
 
-/**
- * State annotation extending CopilotKit state.
- * CopilotKitStateAnnotation.spec includes:
- * - messages: The conversation messages
- * - copilotkit.actions: Frontend tools from the UI
- * - copilotkit.context: Readable context from the UI
- * 
- * This is the KEY to making frontend tools work with createAgent!
- */
-const OrchestratorLangchainStateAnnotation = Annotation.Root({
+const OrchestratorStateAnnotation = Annotation.Root({
   ...CopilotKitStateAnnotation.spec,
 });
 
-export type OrchestratorLangchainState = typeof OrchestratorLangchainStateAnnotation.State;
-
-// ============================================================================
-// INNER AGENT CHECKPOINTER
-// ============================================================================
-
-const innerAgentCheckpointer = new MemorySaver();
+export type OrchestratorState = typeof OrchestratorStateAnnotation.State;
 
 // ============================================================================
 // SYSTEM PROMPT
@@ -57,158 +43,129 @@ const ORCHESTRATOR_SYSTEM_PROMPT = `You are The Orchestrator - a helpful AI assi
 You have access to frontend tools that allow you to:
 
 ### Navigation & View Control
+- **switchViewMode(mode)** - Change view: "document", "list", "graph", or "table"
 - **navigateToProject(projectId)** - Navigate to a specific project by ID
 - **goToProjectsList()** - Return to the projects list page
-- **switchViewMode(mode)** - Change view: "document", "list", "graph", or "table"
 - **selectNode(nodeId)** - Select a node in the tree
-- **scrollToNode(nodeId)** - Scroll to make a node visible
-- **expandNode(nodeId)** - Expand a collapsed node
-- **collapseNode(nodeId)** - Collapse an expanded node
-- **expandAllNodes()** - Expand entire tree
-- **collapseAllNodes()** - Collapse entire tree
 - **toggleDetailPane()** - Show/hide the detail panel
 - **showNotification(message, type)** - Show a toast notification
 
-### Edit Mode (REQUIRED before creating/updating nodes)
-- **requestEditMode()** - Request edit lock before creating/updating nodes
-- **releaseEditMode()** - Release the edit lock when done editing
-- **checkEditStatus()** - Check if you have edit access
-
 ### Project Management
-- **listProjects(searchTerm?, clientId?, sortBy?)** - List projects
+- **listProjects(searchTerm?, clientId?)** - List projects
 - **getProjectDetails(projectId?, projectName?)** - Get project info
 - **createProject(name, clientId, description?, templateId?)** - Create new project
 - **openProjectByName(projectName)** - Search and navigate to project
-- **getProjectTemplates()** - List available project templates
-- **getClients()** - List available clients
 
-### Node Information (Read-only)
-- **getProjectHierarchyInfo()** - Get hierarchy levels, coding config
-- **getNodeChildren(nodeId?)** - Get children of a node
+### Node Operations
 - **getNodeDetails(nodeId?)** - Get detailed info about a node
-- **getNodesByLevel(level?, levelName?, limit?)** - Find nodes at a hierarchy level
-- **getAvailableTemplates(parentNodeId?)** - Get templates valid for parent
-- **getNodeTemplateFields(templateId)** - Get field schema for a template
-- **getNodeFields(nodeId?)** - Read current field values
-
-### Node Creation & Editing (REQUIRES edit mode)
+- **getNodeChildren(nodeId?)** - Get children of a node
 - **createNode(templateId, title, parentNodeId?, initialFields?)** - Create a node
 - **updateNodeFields(nodeId?, fieldUpdates)** - Update fields
 
-### Template Exploration
-- **listAllNodeTemplates(projectTemplateId?, nodeType?, limit?)** - Browse node templates
-- **listFieldTemplates(fieldType?, limit?)** - Browse field templates
-- **getTemplateDetails(templateId, templateType?)** - Get full template details
-
-### Document Management
-- **uploadDocument(category, instructions?)** - Trigger upload dialog
-
-### Media Library (Microverse)
-- **searchMicroverse(query?, fileType?, category?, limit?)** - Search media
-- **getMicroverseDetails(fileId)** - Get media asset info
-- **getMicroverseUsage(fileId)** - Check where asset is used
-- **attachMicroverseToNode(nodeId, fileId, fieldAssignmentId)** - Attach media
-- **detachMicroverseFromNode(nodeId, fileId, fieldAssignmentId)** - Remove media
-
-### Framework & Criteria Mapping
-- **listFrameworks(category?, status?)** - List competency frameworks
-- **getFrameworkDetails(frameworkId)** - Get framework info
-- **searchASQAUnits(query, limit?)** - Search ASQA training units
-- **linkFrameworkToProject(frameworkId, projectId)** - Link framework
-- **mapCriteriaToNode(nodeId, criteriaId)** - Map criteria to node
-- **suggestCriteriaMappings(nodeId)** - Get AI-suggested mappings
-
-### User Interaction Tools
+### User Interaction
+- **offerOptions(question, option_1, option_2?, option_3?)** - Present choices to user
 - **askClarifyingQuestions(questions)** - Ask questions with options
-- **offerOptions(title, options, allowMultiple?)** - Present choices to user
-- **requestPlanApproval(plan, title?)** - Get approval for a plan
-- **requestActionApproval(action, reason?)** - Confirm sensitive action
 
-## Guidelines
+## CRITICAL: You MUST use tools to take action
 
-1. **Always ask before acting** - Present options and wait for user direction
-2. **Use tools directly** when possible for navigation, listing, creating nodes
-3. **Use offerOptions or askClarifyingQuestions** when presenting choices
-4. **Request edit mode** before creating or updating any nodes
-5. **Be helpful and concise** in your responses
-6. **Summarize what was done** after completing any action
+When the user asks you to do something, you MUST call the appropriate tool. DO NOT just say you will do it.
 
-## Important Rules
+Examples:
+- "switch to graph view" → CALL switchViewMode({ mode: "graph" })
+- "show me projects" → CALL listProjects({})
+- "go to document view" → CALL switchViewMode({ mode: "document" })
 
-- ALWAYS call frontend tools ONE AT A TIME, never in parallel
-- After ANY action, summarize what was done and offer next steps
-- If unsure, ask the user for clarification
-- Keep the user informed of progress`;
+ALWAYS call the tool. NEVER just describe what you would do.`;
 
 // ============================================================================
-// AGENT NODE - Simple createAgent without middleware
+// MODEL SETUP
+// ============================================================================
+
+const model = new ChatAnthropic({
+  model: "claude-sonnet-4-20250514",
+  temperature: 0,
+});
+
+// ============================================================================
+// AGENT NODE - Simple model.bindTools() pattern
 // ============================================================================
 
 async function orchestratorNode(
-  state: OrchestratorLangchainState,
+  state: OrchestratorState,
   config: RunnableConfig
-): Promise<Partial<OrchestratorLangchainState>> {
+): Promise<Partial<OrchestratorState>> {
   console.log("\n[orchestrator-langchain] ============ Agent Node ============");
   console.log("  Messages count:", state.messages?.length ?? 0);
 
-  // Get frontend actions from CopilotKit state
-  const frontendActions = state.copilotkit?.actions ?? [];
-  console.log("  Available frontend actions:", frontendActions.length);
-
-  // Convert CopilotKit actions to DynamicStructuredTools
-  // These tools have empty func() - CopilotKit executes them client-side
-  const frontendTools = convertActionsToDynamicStructuredTools(frontendActions);
-  console.log("  Converted to tools:", frontendTools.map(t => t.name).join(", ") || "none");
+  // Get frontend tools from CopilotKit state
+  const tools = state.copilotkit?.actions ?? [];
+  console.log("  Frontend tools available:", tools.length);
 
   // Customize config to emit tool calls for CopilotKit
   const customConfig = copilotkitCustomizeConfig(config, {
     emitToolCalls: true,
   });
 
-  // Get thread_id from outer config
-  const threadId = config.configurable?.thread_id ?? `inner-${Date.now()}`;
-  console.log("  Thread ID:", threadId);
+  // Bind tools to model (CopilotKit actions are already in tool format)
+  const modelWithTools = model.bindTools(tools);
 
-  // Create the agent - NO middleware, let CopilotKit handle frontend tools
-  const agent = createAgent({
-    model: "anthropic:claude-sonnet-4-20250514",
-    tools: frontendTools,
-    systemPrompt: ORCHESTRATOR_SYSTEM_PROMPT,
-    checkpointer: innerAgentCheckpointer,
-  });
+  // Build messages with system prompt
+  const messages: BaseMessage[] = [
+    { role: "system", content: ORCHESTRATOR_SYSTEM_PROMPT } as any,
+    ...(state.messages || []),
+  ];
 
-  console.log("  Invoking createAgent (CopilotKit handles frontend tools)...");
+  console.log("  Calling model with", tools.length, "bound tools...");
 
   try {
-    const result = await agent.invoke(
-      { messages: state.messages || [] },
-      { 
-        ...customConfig,
-        configurable: { 
-          ...customConfig.configurable,
-          thread_id: threadId 
-        }
-      }
-    );
+    const response = await modelWithTools.invoke(messages, customConfig);
 
-    console.log("  Agent response received");
-    console.log("  Output messages:", result.messages?.length || 0);
+    // Log what we got
+    const aiMessage = response as AIMessage;
+    if (aiMessage.tool_calls && aiMessage.tool_calls.length > 0) {
+      console.log("  Tool calls:", aiMessage.tool_calls.map(tc => tc.name).join(", "));
+    } else {
+      console.log("  Text response (no tool calls)");
+    }
 
     return {
-      messages: result.messages,
+      messages: [response],
     };
   } catch (error) {
-    console.error("  [ERROR] Agent invocation failed:", error);
+    console.error("  [ERROR] Model invocation failed:", error);
     throw error;
   }
 }
 
 // ============================================================================
-// ROUTING
+// ROUTING - Handle tool execution flow
 // ============================================================================
 
-function shouldContinue(state: OrchestratorLangchainState): "__end__" {
-  console.log("\n[routing] Agent completed, routing to END");
+function shouldContinue(state: OrchestratorState): "__end__" | "orchestrator" {
+  const messages = state.messages || [];
+  const lastMessage = messages[messages.length - 1];
+  
+  if (!lastMessage) {
+    console.log("[routing] No messages, ending");
+    return "__end__";
+  }
+
+  // Check if last message is a ToolMessage (result from CopilotKit)
+  // If so, continue to the agent to process the result
+  if ('tool_call_id' in lastMessage) {
+    console.log("[routing] ToolMessage received → continue to agent");
+    return "orchestrator";
+  }
+
+  // Check if last message is AIMessage with tool calls
+  const aiMessage = lastMessage as AIMessage;
+  if (aiMessage.tool_calls && aiMessage.tool_calls.length > 0) {
+    console.log("[routing] Tool calls present → END (CopilotKit executes)");
+    return "__end__";
+  }
+  
+  // No tool calls, we're done
+  console.log("[routing] No tool calls → END");
   return "__end__";
 }
 
@@ -218,11 +175,12 @@ function shouldContinue(state: OrchestratorLangchainState): "__end__" {
 
 console.log("[orchestrator-langchain] Building workflow graph...");
 
-const workflow = new StateGraph(OrchestratorLangchainStateAnnotation)
+const workflow = new StateGraph(OrchestratorStateAnnotation)
   .addNode("orchestrator", orchestratorNode)
   .addEdge(START, "orchestrator")
   .addConditionalEdges("orchestrator", shouldContinue, {
     __end__: END,
+    orchestrator: "orchestrator",
   });
 
 // ============================================================================
@@ -251,4 +209,5 @@ export const agent = workflow.compile({
 });
 
 console.log("[orchestrator-langchain] Workflow graph compiled successfully");
-console.log("[orchestrator-langchain] Using createAgent with CopilotKitStateAnnotation");
+console.log("[orchestrator-langchain] Pattern: model.bindTools() + StateGraph");
+console.log("[orchestrator-langchain] Tool execution: CopilotKit handles client-side");

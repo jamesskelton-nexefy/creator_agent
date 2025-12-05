@@ -21,9 +21,11 @@ import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { 
   CopilotKitStateAnnotation, 
   convertActionsToDynamicStructuredTools, 
-  copilotkitCustomizeConfig,
-  copilotKitInterrupt 
+  copilotkitCustomizeConfig
 } from "@copilotkit/sdk-js/langgraph";
+import { interrupt } from "@langchain/langgraph";
+import { AIMessage } from "@langchain/core/messages";
+import { randomUUID } from "crypto";
 
 // ============================================================================
 // STATE DEFINITION
@@ -71,18 +73,41 @@ function createFrontendToolMiddleware(frontendToolNames: Set<string>) {
         console.log(`[FrontendToolMiddleware] Args:`, JSON.stringify(request.toolCall.args, null, 2));
         console.log(`[FrontendToolMiddleware] Creating interrupt for CopilotKit execution...`);
         
-        // Use copilotKitInterrupt to create a proper LangGraph interrupt
-        // This pauses the graph and lets CopilotKit execute the tool client-side
-        const { answer, messages } = copilotKitInterrupt({
-          action: request.toolCall.name,
-          args: request.toolCall.args,
+        // Create the interrupt with CopilotKit-specific data structure
+        // This pauses the graph and emits an interrupt event that CopilotKit can handle
+        const toolId = `ck-${randomUUID()}`;
+        const interruptMessage = new AIMessage({
+          content: "",
+          tool_calls: [{
+            id: toolId,
+            name: request.toolCall.name,
+            args: request.toolCall.args,
+          }],
         });
         
-        console.log(`[FrontendToolMiddleware] Resumed from interrupt with answer:`, answer);
+        // Call interrupt() directly - this pauses the graph
+        // CopilotKit will receive the interrupt, execute the tool client-side,
+        // and resume the graph with the result
+        const response = interrupt({
+          __copilotkit_interrupt_value__: {
+            action: request.toolCall.name,
+            args: request.toolCall.args,
+          },
+          __copilotkit_messages__: [interruptMessage],
+        });
+        
+        // When graph resumes, response contains the messages from CopilotKit
+        // Extract the answer from the last message
+        console.log(`[FrontendToolMiddleware] Resumed from interrupt, response:`, response);
+        const answer = Array.isArray(response) && response.length > 0 
+          ? response[response.length - 1]?.content ?? ""
+          : typeof response === "string" ? response : "";
+        
+        console.log(`[FrontendToolMiddleware] Extracted answer:`, answer);
         
         // Return the answer as a ToolMessage
         return new ToolMessage({
-          content: answer ?? "",
+          content: answer,
           tool_call_id: request.toolCall.id,
           name: request.toolCall.name,
         });

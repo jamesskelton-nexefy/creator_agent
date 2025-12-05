@@ -124,12 +124,12 @@ export function stripThinkingBlocks(messages: BaseMessage[]): BaseMessage[] {
         });
 
         // If content changed, create a new message with filtered content
+        // Don't copy additional_kwargs/response_metadata - they may contain
+        // provider-specific data that shouldn't be re-sent
         if (filteredContent.length !== content.length) {
           return new AIMessage({
             content: filteredContent,
             tool_calls: aiMsg.tool_calls,
-            additional_kwargs: aiMsg.additional_kwargs,
-            response_metadata: aiMsg.response_metadata,
             id: aiMsg.id,
           });
         }
@@ -200,17 +200,18 @@ export function filterOrphanedToolResults(
         if (resolvedToolCalls.length > 0) {
           if (unresolvedToolCalls.length > 0) {
             // Create new AI message with only resolved tool_calls
+            // IMPORTANT: Don't copy aiMsg.content - with Anthropic, content contains
+            // tool_use blocks that would duplicate with tool_calls when serialized.
+            // Let LangChain rebuild content from tool_calls to avoid duplicate IDs.
             const newAiMsg = new AIMessage({
-              content: aiMsg.content,
+              content: "",  // Let LangChain handle content reconstruction from tool_calls
               tool_calls: resolvedToolCalls,
               id: aiMsg.id,
               name: aiMsg.name,
-              additional_kwargs: { ...aiMsg.additional_kwargs },
-              response_metadata: aiMsg.response_metadata,
             });
             filtered.push(newAiMsg);
             console.log(
-              `  ${prefix}[FILTER] Kept AI message with ${resolvedToolCalls.length} resolved tool_calls`
+              `  ${prefix}[FILTER] Kept AI message with ${resolvedToolCalls.length} resolved tool_calls (content cleared to avoid duplicate tool_use IDs)`
             );
           } else {
             // All tool_calls are resolved, keep the original
@@ -689,14 +690,15 @@ export function clearOldToolResults(
               return tc;
             });
 
+            // Don't copy content - with Anthropic, content contains tool_use blocks
+            // that would duplicate with tool_calls when serialized.
+            // Let LangChain rebuild content from tool_calls.
             result.push(
               new AIMessage({
-                content: aiMsg.content,
+                content: "",
                 tool_calls: clearedToolCalls,
                 id: aiMsg.id,
                 name: aiMsg.name,
-                additional_kwargs: aiMsg.additional_kwargs,
-                response_metadata: aiMsg.response_metadata,
               })
             );
             continue;

@@ -19,6 +19,7 @@
     "@langchain/textsplitters": "^0.1.0",
     "@supabase/supabase-js": "^2.58.0",
     "dotenv": "^17.2.3",
+    "langchain": "^1.0.0",
     "mammoth": "^1.8.0",
     "openai": "^6.9.1",
     "pdf-parse": "^1.1.1",

@@ -15,8 +15,6 @@ import "dotenv/config";
 import { createAgent } from "langchain";
 import { SystemMessage } from "@langchain/core/messages";
 import { RunnableConfig } from "@langchain/core/runnables";
-import { tool } from "@langchain/core/tools";
-import { z } from "zod";
 import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { CopilotKitStateAnnotation } from "@copilotkit/sdk-js/langgraph";

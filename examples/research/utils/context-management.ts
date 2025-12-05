@@ -173,6 +173,13 @@ export function filterOrphanedToolResults(
     }
   }
 
+  // Track tool_call IDs we've already processed to deduplicate
+  // CRITICAL: CopilotKit with emitToolCalls:true creates duplicate AIMessages
+  // - One from Claude's original response (with content + tool_calls)
+  // - One from ActionExecutionMessage conversion (with empty content + tool_calls)
+  // Both have the SAME tool_call IDs, causing Anthropic API errors
+  const processedToolCallIds = new Set<string>();
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const msgType = getMessageType(msg);
@@ -182,6 +189,19 @@ export function filterOrphanedToolResults(
 
       // Check for tool_calls that need filtering
       if (aiMsg.tool_calls?.length) {
+        // Check if ALL tool_calls in this message have already been processed
+        // If so, this is a duplicate AIMessage from CopilotKit - skip it entirely
+        const allToolCallIds = aiMsg.tool_calls.map(tc => tc.id).filter(Boolean);
+        const allAlreadyProcessed = allToolCallIds.length > 0 && 
+          allToolCallIds.every(id => processedToolCallIds.has(id!));
+        
+        if (allAlreadyProcessed) {
+          console.log(
+            `  ${prefix}[FILTER] Skipping duplicate AIMessage - tool_calls already processed: ${aiMsg.tool_calls.map(tc => tc.name).join(", ")}`
+          );
+          continue;
+        }
+
         const resolvedToolCalls = aiMsg.tool_calls.filter(
           (tc) => tc.id && toolResultIds.has(tc.id)
         );
@@ -200,6 +220,11 @@ export function filterOrphanedToolResults(
         // Claude returns AI messages with tool_use in BOTH content AND tool_calls.
         // If we pass the original, LangChain serializes both - causing Anthropic API errors.
         if (resolvedToolCalls.length > 0) {
+          // Mark these tool_call IDs as processed to prevent duplicates
+          resolvedToolCalls.forEach(tc => {
+            if (tc.id) processedToolCallIds.add(tc.id);
+          });
+
           // Always create new AI message with only tool_calls (no content)
           // This prevents duplicate tool_use IDs when serialized for Anthropic
           const newAiMsg = new AIMessage({

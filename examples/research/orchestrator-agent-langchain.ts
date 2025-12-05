@@ -9,16 +9,21 @@
  * - Uses createAgent from langchain v1 (built on LangGraph internally)
  * - Has access to all frontend tools via CopilotKit state
  * - Provides a simpler, more standard agent loop
- * - Uses custom middleware to intercept frontend tools for CopilotKit auto-execution
+ * - Uses custom middleware with copilotKitInterrupt for frontend tool execution
  */
 
 import "dotenv/config";
 import { createAgent, createMiddleware } from "langchain";
-import { SystemMessage, ToolMessage } from "@langchain/core/messages";
+import { ToolMessage } from "@langchain/core/messages";
 import { RunnableConfig } from "@langchain/core/runnables";
-import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
+import { StateGraph, START, END, Annotation, MemorySaver } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
-import { CopilotKitStateAnnotation, convertActionsToDynamicStructuredTools, copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
+import { 
+  CopilotKitStateAnnotation, 
+  convertActionsToDynamicStructuredTools, 
+  copilotkitCustomizeConfig,
+  copilotKitInterrupt 
+} from "@copilotkit/sdk-js/langgraph";
 
 // ============================================================================
 // STATE DEFINITION
@@ -37,13 +42,12 @@ const OrchestratorLangchainStateAnnotation = Annotation.Root({
 export type OrchestratorLangchainState = typeof OrchestratorLangchainStateAnnotation.State;
 
 // ============================================================================
-// FRONTEND TOOL MIDDLEWARE - Intercept frontend tools for CopilotKit execution
+// FRONTEND TOOL MIDDLEWARE - Uses copilotKitInterrupt for proper interrupts
 // ============================================================================
 
 /**
- * Creates middleware that intercepts frontend tool calls and short-circuits
- * server-side execution. Instead, the tool call is emitted to CopilotKit
- * which executes it client-side in the browser.
+ * Creates middleware that intercepts frontend tool calls and uses
+ * copilotKitInterrupt to properly pause the graph for CopilotKit execution.
  * 
  * This follows the LangChain custom middleware pattern:
  * https://docs.langchain.com/oss/javascript/langchain/middleware/custom#wrap-style-hooks
@@ -51,11 +55,11 @@ export type OrchestratorLangchainState = typeof OrchestratorLangchainStateAnnota
  * How it works:
  * 1. Agent calls a frontend tool (e.g., switchViewMode)
  * 2. Middleware intercepts via wrapToolCall
- * 3. Middleware returns placeholder ToolMessage (doesn't execute server-side)
- * 4. Tool call is emitted to CopilotKit (via emitToolCalls: true)
+ * 3. Middleware calls copilotKitInterrupt() which creates a LangGraph interrupt
+ * 4. Graph pauses and emits interrupt event to CopilotKit
  * 5. CopilotKit executes the tool in the browser
- * 6. CopilotKit sends real ToolMessage result back
- * 7. Agent continues with actual result
+ * 6. CopilotKit resumes the graph with the tool result
+ * 7. Middleware receives the answer and returns it as a ToolMessage
  */
 function createFrontendToolMiddleware(frontendToolNames: Set<string>) {
   return createMiddleware({
@@ -65,16 +69,20 @@ function createFrontendToolMiddleware(frontendToolNames: Set<string>) {
       if (frontendToolNames.has(request.toolCall.name)) {
         console.log(`[FrontendToolMiddleware] Intercepting frontend tool: ${request.toolCall.name}`);
         console.log(`[FrontendToolMiddleware] Args:`, JSON.stringify(request.toolCall.args, null, 2));
-        console.log(`[FrontendToolMiddleware] Skipping server execution - CopilotKit will handle this client-side`);
+        console.log(`[FrontendToolMiddleware] Creating interrupt for CopilotKit execution...`);
         
-        // Return placeholder ToolMessage - CopilotKit will execute and provide real result
-        // The tool call is still emitted (via emitToolCalls: true) so CopilotKit sees it
+        // Use copilotKitInterrupt to create a proper LangGraph interrupt
+        // This pauses the graph and lets CopilotKit execute the tool client-side
+        const { answer, messages } = copilotKitInterrupt({
+          action: request.toolCall.name,
+          args: request.toolCall.args,
+        });
+        
+        console.log(`[FrontendToolMiddleware] Resumed from interrupt with answer:`, answer);
+        
+        // Return the answer as a ToolMessage
         return new ToolMessage({
-          content: JSON.stringify({ 
-            pending: true, 
-            executedBy: "copilotkit",
-            note: "This tool is executed client-side by CopilotKit" 
-          }),
+          content: answer ?? "",
           tool_call_id: request.toolCall.id,
           name: request.toolCall.name,
         });
@@ -206,7 +214,7 @@ async function orchestratorNode(
   console.log("  Frontend tool names:", Array.from(frontendToolNames).join(", ") || "none");
 
   // Convert CopilotKit actions to DynamicStructuredTools
-  // These tools don't need to do anything server-side - the middleware handles them
+  // The actual execution is handled by the middleware via copilotKitInterrupt
   const frontendTools = convertActionsToDynamicStructuredTools(frontendActions);
   console.log("  Converted to tools:", frontendTools.map(t => t.name).join(", ") || "none");
 
@@ -217,24 +225,17 @@ async function orchestratorNode(
   });
 
   // Create the agent using LangChain's createAgent with custom middleware
-  // The middleware intercepts frontend tools and short-circuits server execution
+  // The middleware uses copilotKitInterrupt to create proper LangGraph interrupts
+  // IMPORTANT: checkpointer is required for copilotKitInterrupt to work
   const agent = createAgent({
     model: "anthropic:claude-sonnet-4-20250514",
     tools: frontendTools,
-    systemPrompt: new SystemMessage({
-      content: [
-        {
-          type: "text",
-          text: ORCHESTRATOR_SYSTEM_PROMPT,
-          // Enable Anthropic prompt caching for the static system prompt
-          cache_control: { type: "ephemeral" },
-        },
-      ],
-    }),
+    systemPrompt: ORCHESTRATOR_SYSTEM_PROMPT,
     middleware: [createFrontendToolMiddleware(frontendToolNames)],
+    checkpointer: new MemorySaver(), // Required for interrupt support
   });
 
-  console.log("  Invoking createAgent with FrontendToolMiddleware...");
+  console.log("  Invoking createAgent with FrontendToolMiddleware (using copilotKitInterrupt)...");
 
   try {
     // Invoke the agent with the current messages
@@ -305,4 +306,4 @@ export const agent = workflow.compile({
 });
 
 console.log("[orchestrator-langchain] Workflow graph compiled successfully");
-console.log("[orchestrator-langchain] Using LangChain createAgent with FrontendToolMiddleware");
+console.log("[orchestrator-langchain] Using LangChain createAgent with copilotKitInterrupt middleware");

@@ -13,14 +13,13 @@
  */
 
 import "dotenv/config";
-import { createAgent } from "langchain";
+import { createAgent, createMiddleware } from "langchain";
 import { SystemMessage } from "@langchain/core/messages";
 import { RunnableConfig } from "@langchain/core/runnables";
 import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { CopilotKitStateAnnotation } from "@copilotkit/sdk-js/langgraph";
 import { copilotkitCustomizeConfig, copilotKitInterrupt } from "@copilotkit/sdk-js/langgraph";
-import type { StructuredToolInterface } from "@langchain/core/tools";
 
 // ============================================================================
 // STATE DEFINITION
@@ -158,8 +157,40 @@ async function orchestratorNode(
     emitToolCalls: true,
   });
 
-  // Create the agent using LangChain's createAgent with middleware
-  // that intercepts frontend tool calls and uses interrupt()
+  // Create middleware to intercept frontend tool calls and use copilotKitInterrupt
+  const frontendToolMiddleware = createMiddleware({
+    name: "FrontendToolInterrupt",
+    wrapToolCall: async (request, handler) => {
+      const toolName = request.toolCall.name;
+      const toolArgs = request.toolCall.args;
+      
+      // Check if this is a frontend tool (all CopilotKit actions are frontend tools)
+      if (frontendToolNames.has(toolName)) {
+        console.log(`\n[middleware] Frontend tool detected: ${toolName}`);
+        console.log(`[middleware] Args:`, JSON.stringify(toolArgs, null, 2));
+        console.log(`[middleware] Using copilotKitInterrupt for CopilotKit to execute...`);
+        
+        // Use copilotKitInterrupt to pause the graph with the proper CopilotKit format
+        // CopilotKit will receive the tool call, execute it in the browser,
+        // and resume the graph with the result
+        const { answer } = copilotKitInterrupt({
+          action: toolName,
+          args: toolArgs as Record<string, any>,
+        });
+        
+        console.log(`[middleware] Resumed from interrupt with answer:`, answer);
+        
+        // Return the answer from the interrupt (CopilotKit provides this when resuming)
+        return answer;
+      }
+      
+      // For non-frontend tools, execute normally via the handler
+      console.log(`[middleware] Server tool: ${toolName}, executing normally`);
+      return await handler(request);
+    },
+  });
+
+  // Create the agent using LangChain's createAgent with middleware array
   const agent = createAgent({
     model: "anthropic:claude-sonnet-4-20250514",
     tools: frontendActions,
@@ -173,36 +204,8 @@ async function orchestratorNode(
         },
       ],
     }),
-    // Middleware to intercept frontend tool calls
-    middleware: {
-      wrapToolCall: async (tool: StructuredToolInterface, args: Record<string, unknown>, runConfig: RunnableConfig) => {
-        const toolName = tool.name;
-        
-        // Check if this is a frontend tool (all CopilotKit actions are frontend tools)
-        if (frontendToolNames.has(toolName)) {
-          console.log(`\n[middleware] Frontend tool detected: ${toolName}`);
-          console.log(`[middleware] Args:`, JSON.stringify(args, null, 2));
-          console.log(`[middleware] Using copilotKitInterrupt for CopilotKit to execute...`);
-          
-          // Use copilotKitInterrupt to pause the graph with the proper CopilotKit format
-          // CopilotKit will receive the tool call, execute it in the browser,
-          // and resume the graph with the result
-          const { answer } = copilotKitInterrupt({
-            action: toolName,
-            args: args as Record<string, any>,
-          });
-          
-          console.log(`[middleware] Resumed from interrupt with answer:`, answer);
-          
-          // Return the answer from the interrupt (CopilotKit provides this when resuming)
-          return answer;
-        }
-        
-        // For non-frontend tools, execute normally
-        console.log(`[middleware] Server tool: ${toolName}, executing normally`);
-        return await tool.invoke(args, runConfig);
-      },
-    },
+    // Middleware must be an array
+    middleware: [frontendToolMiddleware],
   });
 
   console.log("  Invoking createAgent with frontend tool middleware...");

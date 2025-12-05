@@ -1287,25 +1287,30 @@ const workflow = new StateGraph(NodeExpertStateAnnotation)
 
 /**
  * Initialize PostgresSaver for persistent conversation storage.
- * Connects to local Supabase PostgreSQL database.
+ * In LangSmith Cloud, checkpointer is provided automatically.
+ * Only use custom PostgresSaver for local development.
  * 
  * Environment variable SUPABASE_DB_URL should be set to:
  * postgresql://postgres:postgres@localhost:15322/postgres
  */
-const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL || "postgresql://postgres:postgres@localhost:15322/postgres";
+const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
+const IS_LANGSMITH_CLOUD = !SUPABASE_DB_URL;
 
-console.log('[node_expert] Initializing PostgreSQL checkpointer...');
-console.log('[node_expert] DB URL:', SUPABASE_DB_URL.replace(/:[^:@]+@/, ':****@')); // Hide password
+let checkpointer: PostgresSaver | undefined;
 
-const checkpointer = PostgresSaver.fromConnString(SUPABASE_DB_URL);
+if (!IS_LANGSMITH_CLOUD && SUPABASE_DB_URL) {
+  console.log('[node_expert] Initializing PostgreSQL checkpointer...');
+  console.log('[node_expert] DB URL:', SUPABASE_DB_URL.replace(/:[^:@]+@/, ':****@'));
+  
+  checkpointer = PostgresSaver.fromConnString(SUPABASE_DB_URL);
+  await checkpointer.setup();
+  console.log('[node_expert] PostgreSQL checkpointer initialized successfully');
+} else {
+  console.log('[node_expert] Running in LangSmith Cloud - using managed checkpointer');
+}
 
-// Setup creates necessary tables if they don't exist
-// This is idempotent and safe to call on every startup
-await checkpointer.setup();
-console.log('[node_expert] PostgreSQL checkpointer initialized successfully');
-
-// Compile the graph with PostgreSQL persistence
+// Compile the graph with PostgreSQL persistence (local) or managed checkpointer (cloud)
 export const agent = workflow.compile({
-  checkpointer,
+  ...(checkpointer && { checkpointer }),
 });
 

@@ -1155,19 +1155,27 @@ const workflow = new StateGraph(OrchestratorStateAnnotation)
 // PERSISTENCE SETUP
 // ============================================================================
 
-const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL || "postgresql://postgres:postgres@localhost:15322/postgres";
+// In LangSmith Cloud, checkpointer is provided automatically
+// Only use custom PostgresSaver for local development
+const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
+const IS_LANGSMITH_CLOUD = !SUPABASE_DB_URL;
 
-console.log("[orchestrator] Initializing PostgreSQL checkpointer...");
-console.log("[orchestrator] DB URL:", SUPABASE_DB_URL.replace(/:[^:@]+@/, ":****@"));
+let checkpointer: PostgresSaver | undefined;
 
-const checkpointer = PostgresSaver.fromConnString(SUPABASE_DB_URL);
-
-await checkpointer.setup();
-console.log("[orchestrator] PostgreSQL checkpointer initialized successfully");
+if (!IS_LANGSMITH_CLOUD && SUPABASE_DB_URL) {
+  console.log("[orchestrator] Initializing PostgreSQL checkpointer...");
+  console.log("[orchestrator] DB URL:", SUPABASE_DB_URL.replace(/:[^:@]+@/, ":****@"));
+  
+  checkpointer = PostgresSaver.fromConnString(SUPABASE_DB_URL);
+  await checkpointer.setup();
+  console.log("[orchestrator] PostgreSQL checkpointer initialized successfully");
+} else {
+  console.log("[orchestrator] Running in LangSmith Cloud - using managed checkpointer");
+}
 
 // Compile the graph
 export const agent = workflow.compile({
-  checkpointer,
+  ...(checkpointer && { checkpointer }),
 });
 
 // Note: recursion_limit is set via config when invoking the graph, not at compile time

@@ -96,6 +96,18 @@ function createFrontendToolMiddleware(frontendToolNames: Set<string>) {
 }
 
 // ============================================================================
+// INNER AGENT CHECKPOINTER - Created once, reused across invocations
+// ============================================================================
+
+/**
+ * The inner createAgent needs its own checkpointer for interrupt support.
+ * This is created once at module load time and reused for all invocations.
+ * In LangSmith Cloud, the managed checkpointer handles the outer graph,
+ * but the inner createAgent still needs this for its internal state.
+ */
+const innerAgentCheckpointer = new MemorySaver();
+
+// ============================================================================
 // SYSTEM PROMPT
 // ============================================================================
 
@@ -232,16 +244,25 @@ async function orchestratorNode(
     tools: frontendTools,
     systemPrompt: ORCHESTRATOR_SYSTEM_PROMPT,
     middleware: [createFrontendToolMiddleware(frontendToolNames)],
-    checkpointer: new MemorySaver(), // Required for interrupt support
+    checkpointer: innerAgentCheckpointer, // Shared checkpointer for interrupt support
   });
 
+  // Get thread_id from the outer config to pass to inner agent
+  const threadId = config.configurable?.thread_id ?? `inner-${Date.now()}`;
+  console.log("  Thread ID for inner agent:", threadId);
   console.log("  Invoking createAgent with FrontendToolMiddleware (using copilotKitInterrupt)...");
 
   try {
-    // Invoke the agent with the current messages
+    // Invoke the agent with the current messages and thread_id for persistence
     const result = await agent.invoke(
       { messages: state.messages || [] },
-      customConfig
+      { 
+        ...customConfig,
+        configurable: { 
+          ...customConfig.configurable,
+          thread_id: threadId 
+        }
+      }
     );
 
     console.log("  Agent response received");

@@ -152,6 +152,84 @@ export class DocumentService {
   }
 
   /**
+   * Hybrid search: tries semantic search first, falls back to text search if no results.
+   * Best for general queries where you want maximum recall.
+   */
+  async hybridSearch(params: {
+    query: string;
+    limit?: number;
+    threshold?: number;
+    category?: "course_content" | "framework_content";
+    orgId?: string;
+    projectId?: string;
+  }): Promise<{
+    source: "semantic" | "text";
+    results: Array<{
+      chunkId: string;
+      documentId: string;
+      documentTitle: string;
+      category: string;
+      content: string;
+      chunkIndex: number;
+      startLine: number;
+      endLine: number;
+      similarity?: number;
+      rank?: number;
+    }>;
+  }> {
+    // Try semantic search first
+    const semanticResults = await this.searchDocuments({
+      query: params.query,
+      limit: params.limit || 5,
+      threshold: params.threshold,
+      category: params.category,
+      orgId: params.orgId,
+      projectId: params.projectId,
+    });
+
+    if (semanticResults.length > 0) {
+      return {
+        source: "semantic",
+        results: semanticResults.map((r) => ({
+          chunkId: r.chunkId,
+          documentId: r.documentId,
+          documentTitle: r.documentTitle,
+          category: r.category,
+          content: r.content,
+          chunkIndex: r.chunkIndex,
+          startLine: r.startLine,
+          endLine: r.endLine,
+          similarity: r.similarity,
+        })),
+      };
+    }
+
+    // Fallback to text search
+    const textResults = await this.searchDocumentsByText({
+      searchText: params.query,
+      limit: params.limit || 10,
+      category: params.category,
+      orgId: params.orgId,
+      projectId: params.projectId,
+    });
+
+    return {
+      source: "text",
+      results: textResults.map((r) => ({
+        chunkId: r.chunkId,
+        documentId: r.documentId,
+        documentTitle: r.documentTitle,
+        category: r.category,
+        content: r.content,
+        chunkIndex: r.chunkIndex,
+        startLine: r.startLine,
+        endLine: r.endLine,
+        rank: r.rank,
+      })),
+    };
+  }
+
+  /**
    * Get document lines by range
    */
   async getDocumentLines(params: {

@@ -341,8 +341,11 @@ app.use('/copilotkit', (req, res, next) => {
 - Architect: Designs course structure
 - Writer: Creates Level 6 content nodes
 - Visual Designer: Defines aesthetics and tone`,
+        // Note: LangGraph Platform API accepts both snake_case and camelCase
+        // Including both for compatibility
         config: {
-          recursion_limit: 100,
+          recursion_limit: 150,
+          recursionLimit: 150,
         },
       }),
       // Legacy node_expert kept for backwards compatibility
@@ -351,7 +354,8 @@ app.use('/copilotkit', (req, res, next) => {
         graphId: 'node_expert',
         description: `Legacy agent for creating nodes directly (use orchestrator for full workflow)`,
         config: {
-          recursion_limit: 100,
+          recursion_limit: 150,
+          recursionLimit: 150,
         },
       })
     },

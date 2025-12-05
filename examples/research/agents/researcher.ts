@@ -140,27 +140,28 @@ const listDocuments = tool(
     description: "List available uploaded documents. Use first to see what's available before searching.",
     schema: z.object({
       category: z.enum(["course_content", "framework_content"]).optional(),
-      limit: z.number().optional().describe("Max documents to return (default: 20)"),
+      limit: z.coerce.number().optional().describe("Max documents to return (default: 20)"),
     }),
   }
 );
 
 const searchDocuments = tool(
   async ({ query, category, limit, threshold }: { query: string; category?: string; limit?: number; threshold?: number }) => {
-    console.log(`  [researcher/searchDocuments] Semantic search: "${query}"`);
+    console.log(`  [researcher/searchDocuments] Hybrid search: "${query}"`);
 
     try {
-      const results = await getDocumentService().searchDocuments({
+      const { source, results } = await getDocumentService().hybridSearch({
         query,
         category: category as "course_content" | "framework_content" | undefined,
         limit: limit || 5,
-        threshold: threshold || 0.7,
+        threshold: threshold,
       });
 
-      console.log(`  [researcher/searchDocuments] Found ${results.length} chunks`);
+      console.log(`  [researcher/searchDocuments] Found ${results.length} chunks via ${source} search`);
 
       return JSON.stringify({
         success: true,
+        searchType: source,
         count: results.length,
         results: results.map((r) => ({
           documentId: r.documentId,
@@ -170,24 +171,25 @@ const searchDocuments = tool(
           chunkIndex: r.chunkIndex,
           startLine: r.startLine,
           endLine: r.endLine,
-          similarity: r.similarity.toFixed(3),
+          similarity: r.similarity?.toFixed(3),
+          rank: r.rank?.toFixed(3),
         })),
       });
     } catch (error) {
       return JSON.stringify({
         success: false,
-        error: `Semantic search failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error: `Search failed: ${error instanceof Error ? error.message : "Unknown error"}`,
       });
     }
   },
   {
     name: "searchDocuments",
-    description: "Semantic search across documents using AI embeddings. Best for conceptual queries.",
+    description: "Search documents using hybrid semantic + text search. Tries AI semantic matching first, falls back to keyword search if no results. Best for longer, descriptive queries (e.g., 'how to perform pre-trip inspections' rather than single words).",
     schema: z.object({
-      query: z.string().describe("What you're looking for conceptually"),
+      query: z.string().describe("Descriptive search query - longer phrases work better than single words"),
       category: z.enum(["course_content", "framework_content"]).optional(),
-      limit: z.number().optional().describe("Max results (default: 5)"),
-      threshold: z.number().optional().describe("Min similarity 0-1 (default: 0.7)"),
+      limit: z.coerce.number().optional().describe("Max results (default: 5)"),
+      threshold: z.coerce.number().optional().describe("Min similarity 0-1 (default: 0.5)"),
     }),
   }
 );
@@ -226,11 +228,11 @@ const searchDocumentsByText = tool(
   },
   {
     name: "searchDocumentsByText",
-    description: "Full-text search for exact terms, definitions, or specific phrases.",
+    description: "Full-text keyword search. Best for single words, exact terms, acronyms (e.g., 'GVM', 'HVNL'), and specific phrases. Use this when searchDocuments returns no results for short queries.",
     schema: z.object({
-      searchText: z.string().describe("Exact text or terms to search for"),
+      searchText: z.string().describe("Keyword or exact phrase to search for - good for single words and acronyms"),
       category: z.enum(["course_content", "framework_content"]).optional(),
-      limit: z.number().optional().describe("Max results (default: 10)"),
+      limit: z.coerce.number().optional().describe("Max results (default: 10)"),
     }),
   }
 );
@@ -282,8 +284,8 @@ const getDocumentLines = tool(
     schema: z.object({
       documentId: z.string().optional(),
       documentName: z.string().optional(),
-      startLine: z.number().describe("Line number to start from"),
-      numLines: z.number().describe("Number of lines to retrieve"),
+      startLine: z.coerce.number().describe("Line number to start from"),
+      numLines: z.coerce.number().describe("Number of lines to retrieve"),
     }),
   }
 );
@@ -352,6 +354,20 @@ export const researcherTools = [
 
 const RESEARCHER_SYSTEM_PROMPT = `You are The Researcher - a specialized agent focused on deep knowledge gathering for online training projects.
 
+## CRITICAL: IMMEDIATE ACTION REQUIRED
+
+**When you receive control from the orchestrator, you MUST immediately use tools to conduct research.**
+
+❌ DO NOT respond with text like "I'll research this..." or "Let me gather information..."
+❌ DO NOT explain what you're going to do - just DO IT
+✅ IMMEDIATELY call web_search or document search tools in your FIRST response
+
+Example: If the orchestrator says "Research heavy vehicle regulations", your response should START with tool calls:
+- Call web_search("heavy vehicle regulations Australia NHVR")
+- Call listDocuments() to check for relevant uploaded docs
+
+NOT: "I'll research heavy vehicle regulations..." (THIS IS WRONG)
+
 ## Your Role
 
 You conduct thorough research to provide comprehensive information that will inform course structure and content. Your research covers:
@@ -378,13 +394,54 @@ You conduct thorough research to provide comprehensive information that will inf
 - **searchMicroverse** - Search existing media assets for reference materials
 - **getMicroverseDetails** - Get details about specific media assets
 
+## CRITICAL: Research Limits & Completion
+
+**⚠️ MANDATORY LIMITS - DO NOT EXCEED:**
+
+1. **Maximum 3 web_search calls TOTAL** - Plan your searches upfront. Each search should cover broad ground.
+2. **Maximum 2 document search calls** - Only if internal docs exist and are relevant
+3. **NO "let me search for more" loops** - Do NOT say "Now let me search for more information on X" and make additional searches. Resist the urge to be exhaustive.
+4. **ONE research phase** - Gather what you need in ONE batch of tool calls, then STOP and synthesize
+
+**🛑 ANTI-PATTERN - DO NOT DO THIS:**
+❌ "Now let me search for more information on [related topic]..."
+❌ "I should also research [additional subtopic]..."
+❌ "Let me dig deeper into [tangential area]..."
+❌ Making tool calls after you already have tool results
+
+**✓ CORRECT PATTERN:**
+1. Make 1-3 web searches in parallel covering the main topic
+2. Optionally check internal documents (1-2 searches max)
+3. IMMEDIATELY synthesize findings and output [DONE]
+
+**WHEN YOU ARE DONE RESEARCHING (MANDATORY):**
+- Output your research findings in the JSON format below
+- Include the marker **[DONE]** at the END of your response
+- This signals you are ready to hand control back to the orchestrator
+- **If you have made 3+ searches, you MUST output [DONE] NOW - no more searching**
+
+**Example completion:**
+\`\`\`
+Based on my research, here are the findings:
+
+\`\`\`json
+{...your research JSON...}
+\`\`\`
+
+I have gathered sufficient information on the key topics, regulations, and industry context.
+
+[DONE]
+\`\`\`
+
 ## Research Strategy
 
-1. **Start Broad** - Use web_search for industry overview and current context
-2. **Check Internal Docs** - Use listDocuments to see what's already available
-3. **Deep Dive Topics** - Research each key topic area identified in the brief
-4. **Verify Regulations** - Specifically search for compliance requirements
-5. **Gather Evidence** - Collect citations for all key claims
+1. **ACT IMMEDIATELY** - Start tool calls in your FIRST response, don't explain first
+2. **Start Broad** - Use web_search for industry overview and current context
+3. **Check Internal Docs** - Use listDocuments to see what's already available
+4. **Deep Dive Critical Topics** - Focus on the most important areas only
+5. **Synthesize & Complete** - After gathering enough info, produce findings and mark [DONE]
+
+**REMEMBER: Your first response must contain tool calls, not explanatory text.**
 
 ## Output Format
 
@@ -409,6 +466,7 @@ Structure your findings as a research brief:
 
 ## Guidelines
 
+- **EFFICIENCY IS KEY** - Get what you need in minimal searches, don't over-research
 - Be thorough but focused - research what's relevant to the project brief
 - Always cite sources for factual claims
 - Distinguish between critical, important, and supplementary topics
@@ -416,12 +474,16 @@ Structure your findings as a research brief:
 - Prioritize recent/current information over dated sources
 - Check both web sources and internal documents
 - Keep context size manageable - summarize rather than dump raw content
+- **Always end with [DONE] when your research is complete**
 
-Remember: Quality research leads to impactful training. Take time to understand the domain deeply.`;
+Remember: Quality research leads to impactful training. Be efficient and focused.`;
 
 // ============================================================================
 // RESEARCHER NODE FUNCTION
 // ============================================================================
+
+// Maximum research iterations before forced completion
+const MAX_RESEARCH_ITERATIONS = 8;
 
 /**
  * The Researcher agent node.
@@ -433,9 +495,50 @@ export async function researcherNode(
 ): Promise<Partial<OrchestratorState>> {
   console.log("\n[researcher] ============ Researcher Agent ============");
   console.log("  Project brief available:", state.projectBrief ? "yes" : "no");
+  
+  // Track research iterations
+  const currentIteration = (state.researchIterationCount || 0) + 1;
+  console.log(`  Research iteration: ${currentIteration}/${MAX_RESEARCH_ITERATIONS}`);
 
   // Build context-aware system message
   let systemContent = RESEARCHER_SYSTEM_PROMPT;
+
+  // Count previous web_search calls in the conversation
+  const messages = state.messages || [];
+  let webSearchCount = 0;
+  let docSearchCount = 0;
+  for (const msg of messages) {
+    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
+    if (msgType === "tool" || msgType === "ToolMessage") {
+      const toolName = (msg as any).name || "";
+      if (toolName === "web_search") webSearchCount++;
+      if (toolName === "searchDocuments" || toolName === "searchDocumentsByText") docSearchCount++;
+    }
+  }
+  
+  const totalSearches = webSearchCount + docSearchCount;
+
+  // Add iteration context to system prompt
+  systemContent += `\n\n## Current Research Status
+- **Iteration**: ${currentIteration} of ${MAX_RESEARCH_ITERATIONS} maximum
+- **Web searches used**: ${webSearchCount}/3 maximum
+- **Document searches used**: ${docSearchCount}/2 maximum  
+- **Total searches**: ${totalSearches}`;
+
+  if (totalSearches >= 3) {
+    systemContent += `
+- **⚠️ SEARCH LIMIT REACHED**: You have made ${totalSearches} searches. DO NOT make more tool calls. Output your findings and [DONE] NOW.`;
+  }
+
+  if (currentIteration >= MAX_RESEARCH_ITERATIONS - 2) {
+    systemContent += `
+- **WARNING**: You are approaching the iteration limit. Synthesize your findings NOW and output [DONE].`;
+  }
+
+  if (currentIteration >= MAX_RESEARCH_ITERATIONS) {
+    systemContent += `
+- **CRITICAL**: This is your FINAL iteration. You MUST output your research findings and [DONE] now. No more tool calls allowed.`;
+  }
 
   // Include project brief if available
   if (state.projectBrief) {
@@ -524,12 +627,36 @@ The user is waiting for research results.`,
     }
   }
 
+  // Check if research is complete (contains [DONE] marker)
+  const responseText = typeof aiResponse.content === "string"
+    ? aiResponse.content
+    : Array.isArray(aiResponse.content)
+    ? aiResponse.content
+        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    : "";
+  
+  const isResearchComplete = responseText.toLowerCase().includes("[done]");
+  
+  if (isResearchComplete) {
+    console.log("  [researcher] Research complete - [DONE] marker found");
+  }
+  
+  // If at max iterations and still making tool calls, force completion
+  const forceComplete = currentIteration >= MAX_RESEARCH_ITERATIONS && aiResponse.tool_calls?.length;
+  if (forceComplete) {
+    console.log("  [researcher] MAX ITERATIONS reached - forcing completion");
+  }
+
   return {
     messages: [response],
     currentAgent: "researcher",
     agentHistory: ["researcher"],
     // Clear routing decision when this agent starts - prevents stale routing
     routingDecision: null,
+    // Update iteration count (reset to 0 if complete, otherwise increment)
+    researchIterationCount: isResearchComplete ? 0 : currentIteration,
   };
 }
 

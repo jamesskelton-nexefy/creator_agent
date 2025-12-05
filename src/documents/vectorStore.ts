@@ -241,7 +241,7 @@ export class VectorStore {
 
     const { data, error } = await this.supabase.rpc("search_documents_by_embedding", {
       query_embedding: JSON.stringify(queryEmbedding),
-      match_threshold: params.threshold ?? 0.7,
+      match_threshold: params.threshold ?? 0.5,
       match_count: params.limit ?? 10,
       filter_category: params.category ?? null,
       filter_org_id: params.orgId ?? null,
@@ -349,32 +349,76 @@ export class VectorStore {
 
   /**
    * Get document by name (title or original filename)
+   * Uses case-insensitive partial matching
    */
   async getDocumentByName(
     name: string,
     orgId?: string
   ): Promise<DocumentMetadata | null> {
+    // First try exact title match (case-insensitive)
     let query = this.supabase
       .schema("documents")
       .from("documents")
       .select("*")
-      .or(`title.ilike.%${name}%,original_filename.ilike.%${name}%`)
+      .ilike("title", name)
       .eq("status", "ready");
 
     if (orgId) {
       query = query.eq("org_id", orgId);
     }
 
-    const { data, error } = await query.limit(1).single();
+    let { data, error } = await query.limit(1).maybeSingle();
 
-    if (error) {
-      if (error.code === "PGRST116") {
-        return null;
-      }
+    if (error && error.code !== "PGRST116") {
       throw new Error(`Failed to get document by name: ${error.message}`);
     }
 
-    return this.mapDocumentRow(data);
+    // If found with exact match, return it
+    if (data) {
+      return this.mapDocumentRow(data);
+    }
+
+    // Try partial title match (contains)
+    query = this.supabase
+      .schema("documents")
+      .from("documents")
+      .select("*")
+      .ilike("title", `%${name}%`)
+      .eq("status", "ready");
+
+    if (orgId) {
+      query = query.eq("org_id", orgId);
+    }
+
+    ({ data, error } = await query.limit(1).maybeSingle());
+
+    if (error && error.code !== "PGRST116") {
+      throw new Error(`Failed to get document by name: ${error.message}`);
+    }
+
+    if (data) {
+      return this.mapDocumentRow(data);
+    }
+
+    // Try original filename match
+    query = this.supabase
+      .schema("documents")
+      .from("documents")
+      .select("*")
+      .ilike("original_filename", `%${name}%`)
+      .eq("status", "ready");
+
+    if (orgId) {
+      query = query.eq("org_id", orgId);
+    }
+
+    ({ data, error } = await query.limit(1).maybeSingle());
+
+    if (error && error.code !== "PGRST116") {
+      throw new Error(`Failed to get document by name: ${error.message}`);
+    }
+
+    return data ? this.mapDocumentRow(data) : null;
   }
 
   /**

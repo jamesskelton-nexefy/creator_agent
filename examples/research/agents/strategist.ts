@@ -9,8 +9,12 @@
  * - offerOptions (frontend HITL) - Present choices to user
  * - getProjectHierarchyInfo - Understand project structure when scoping
  * - listProjects - Check existing projects for reference
+ * - listFrameworks - Browse available frameworks in the system
+ * - getFrameworkDetails - Get details of a specific framework
+ * - searchASQAUnits - Search TGA (training.gov.au) for ASQA units
+ * - listDocuments - Check uploaded documents (may include framework docs)
  *
- * Output: projectBrief in shared state
+ * Output: projectBrief in shared state (including frameworks)
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
@@ -54,20 +58,38 @@ You are the first step in creating impactful training content. Your job is to de
 4. **Constraints** - Time limits, budget, technical requirements, compliance needs
 5. **Target Audience** - Who are the learners? What's their background?
 6. **Industry Context** - What industry or domain is this for?
+7. **Frameworks & Standards** - What training packages, competency frameworks, or regulatory standards apply?
 
 ## Your Tools
 
-You have access to two Human-in-the-Loop tools:
+### Conversation Tools (Human-in-the-Loop)
 
-### askClarifyingQuestions
-Use this to ask the user a series of questions (up to 5) to gather information.
+**askClarifyingQuestions** - Ask the user a series of questions (up to 5) to gather information.
 - Each question should have 2-5 clear, distinct options
 - Questions are presented one at a time
 - Order questions from general to specific
 - Make options mutually exclusive when possible
 
-### offerOptions
-Use this for single-choice decisions when you need the user to pick between approaches.
+**offerOptions** - For single-choice decisions when you need the user to pick between approaches.
+
+### Framework & Standards Tools
+
+**listFrameworks** - Browse frameworks already linked to the project or available in the system.
+
+**getFrameworkDetails** - Get detailed information about a specific framework, including its units/competencies.
+
+**searchASQAUnits** - Search training.gov.au (TGA) for ASQA training package units. Use this when:
+- User mentions a qualification (e.g., "Certificate III in Heavy Vehicle")
+- User mentions a unit code (e.g., "TLID0015")
+- User works in a regulated industry (transport, health, construction, etc.)
+- Training needs to align with national competency standards
+
+**listDocuments** - Check uploaded documents which may include framework documents, compliance guides, or standards.
+
+### Context Tools
+
+**getProjectHierarchyInfo** - Understand existing project structure when scoping.
+**listProjects** - Check existing projects for reference.
 
 ## Strategy Session Flow
 
@@ -78,8 +100,14 @@ Use this for single-choice decisions when you need the user to pick between appr
    - Industry/domain context
    - Scope preferences (broad overview vs deep dive)
    - Any constraints or requirements
-3. **Synthesize** - Process user responses into a structured project brief
-4. **Confirm** - Summarize back and get confirmation
+   - **Compliance/Framework needs** - Does this need to align with a training package or standards?
+3. **Capture Frameworks** - Based on user responses:
+   - If user mentions qualifications/units, use searchASQAUnits to find relevant ASQA units
+   - If user mentions compliance/standards, use listFrameworks to check existing frameworks
+   - If user uploaded documents, use listDocuments to check for framework documents
+   - Ask about specific competencies they want to cover
+4. **Synthesize** - Process user responses into a structured project brief
+5. **Confirm** - Summarize back and get confirmation (including any frameworks identified)
 
 ## CRITICAL: Tool Usage - READ THIS CAREFULLY
 
@@ -112,6 +140,17 @@ After gathering information, structure your findings as a project brief that inc
 - targetAudience: Detailed learner persona
 - industry: Industry or domain context
 - regulations: Any compliance requirements (if applicable)
+- frameworks: Any relevant training packages, standards, or competency frameworks including:
+  - Name of the framework/training package
+  - Type (training_package, asqa_unit, custom, uploaded)
+  - Specific units or competencies to cover
+  - Notes on why it's relevant
+
+### Framework Examples
+- If building heavy vehicle training: Search for "TLI Transport and Logistics" training package
+- If building health training: Look for HLT Health or CHC Community Services units
+- If user mentions a unit code like "TLID0015": Search for that specific unit
+- If user uploaded a "Load Restraint Guide": Note it as an uploaded framework document
 
 ## Guidelines
 
@@ -155,13 +194,18 @@ export async function strategistNode(
   console.log("  Current project brief:", state.projectBrief ? "exists" : "none");
 
   // Get frontend tools from CopilotKit state
-  // The strategist uses conversation tools + minimal read tools for context
+  // The strategist uses conversation tools + framework tools + minimal read tools for context
   const frontendActions = state.copilotkit?.actions ?? [];
   const strategistTools = frontendActions.filter((action: { name: string }) =>
     [
       // Conversation tools
       "askClarifyingQuestions",
       "offerOptions",
+      // Framework & Standards tools
+      "listFrameworks",
+      "getFrameworkDetails", 
+      "searchASQAUnits",
+      "listDocuments",
       // Context tools (understand what exists)
       "getProjectHierarchyInfo",
       "listProjects",
@@ -341,6 +385,7 @@ function validateProjectBrief(input: Partial<ProjectBrief>): ProjectBrief {
     targetAudience: input.targetAudience || "General learners",
     industry: input.industry || "General",
     regulations: input.regulations,
+    frameworks: input.frameworks,
     notes: input.notes,
   };
 }

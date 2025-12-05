@@ -16,4 +16,5 @@ export {
   suggestThemes,
   DESIGN_THEMES,
 } from "./visual-designer";
+export { dataAgentNode } from "./data-agent";
 

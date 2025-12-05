@@ -355,13 +355,13 @@ const listDocuments = tool(
       category: z.enum(["course_content", "framework_content"]).optional().describe("Filter by document category"),
       orgId: z.string().optional().describe("Filter by organization ID"),
       projectId: z.string().optional().describe("Filter by project ID"),
-      limit: z.number().optional().describe("Maximum number of documents to return (default: 20)"),
+      limit: z.coerce.number().optional().describe("Maximum number of documents to return (default: 20)"),
     }),
   }
 );
 
 /**
- * Semantic search across document chunks using vector similarity.
+ * Hybrid search across document chunks - tries semantic first, falls back to text search.
  */
 const searchDocuments = tool(
   async ({ query, category, limit, threshold }: { 
@@ -370,20 +370,21 @@ const searchDocuments = tool(
     limit?: number;
     threshold?: number;
   }) => {
-    console.log(`  [searchDocuments] Semantic search for: "${query}"`);
+    console.log(`  [searchDocuments] Hybrid search for: "${query}"`);
     
     try {
-      const results = await getDocumentService().searchDocuments({
+      const { source, results } = await getDocumentService().hybridSearch({
         query,
         category: category as "course_content" | "framework_content" | undefined,
         limit: limit || 5,
-        threshold: threshold || 0.7,
+        threshold: threshold,
       });
 
-      console.log(`  [searchDocuments] Found ${results.length} matching chunks`);
+      console.log(`  [searchDocuments] Found ${results.length} chunks via ${source} search`);
 
       return JSON.stringify({
         success: true,
+        searchType: source,
         count: results.length,
         results: results.map(r => ({
           documentId: r.documentId,
@@ -393,25 +394,26 @@ const searchDocuments = tool(
           chunkIndex: r.chunkIndex,
           startLine: r.startLine,
           endLine: r.endLine,
-          similarity: r.similarity.toFixed(3),
+          similarity: r.similarity?.toFixed(3),
+          rank: r.rank?.toFixed(3),
         })),
       });
     } catch (error) {
       console.error(`  [searchDocuments] Error:`, error);
       return JSON.stringify({
         success: false,
-        error: `Semantic search failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        error: `Search failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
       });
     }
   },
   {
     name: "searchDocuments",
-    description: "Semantic search across uploaded documents using AI embeddings. Best for finding conceptually related content, even if exact words don't match. Use for broad topical queries.",
+    description: "Search documents using hybrid semantic + text search. Tries AI semantic matching first, falls back to keyword search if no results. Best for longer, descriptive queries (e.g., 'how to perform pre-trip inspections' rather than single words).",
     schema: z.object({
-      query: z.string().describe("The search query - describe what you're looking for conceptually"),
+      query: z.string().describe("Descriptive search query - longer phrases work better than single words"),
       category: z.enum(["course_content", "framework_content"]).optional().describe("Filter by document category"),
-      limit: z.number().optional().describe("Maximum number of results (default: 5)"),
-      threshold: z.number().optional().describe("Minimum similarity score 0-1 (default: 0.7)"),
+      limit: z.coerce.number().optional().describe("Maximum number of results (default: 5)"),
+      threshold: z.coerce.number().optional().describe("Minimum similarity score 0-1 (default: 0.5)"),
     }),
   }
 );
@@ -460,11 +462,11 @@ const searchDocumentsByText = tool(
   },
   {
     name: "searchDocumentsByText",
-    description: "Full-text search for exact term matches in documents. Best for finding specific terms, definitions, names, or exact phrases. More precise than semantic search.",
+    description: "Full-text keyword search. Best for single words, exact terms, acronyms (e.g., 'GVM', 'HVNL'), and specific phrases. Use this when searchDocuments returns no results for short queries.",
     schema: z.object({
-      searchText: z.string().describe("The exact text or terms to search for"),
+      searchText: z.string().describe("Keyword or exact phrase to search for - good for single words and acronyms"),
       category: z.enum(["course_content", "framework_content"]).optional().describe("Filter by document category"),
-      limit: z.number().optional().describe("Maximum number of results (default: 10)"),
+      limit: z.coerce.number().optional().describe("Maximum number of results (default: 10)"),
     }),
   }
 );
@@ -536,8 +538,8 @@ const getDocumentLines = tool(
     schema: z.object({
       documentId: z.string().optional().describe("The document ID (from search results or listDocuments)"),
       documentName: z.string().optional().describe("The document title/name to look up (alternative to documentId)"),
-      startLine: z.number().describe("The line number to start from"),
-      numLines: z.number().describe("Number of lines to retrieve"),
+      startLine: z.coerce.number().describe("The line number to start from"),
+      numLines: z.coerce.number().describe("Number of lines to retrieve"),
     }),
   }
 );

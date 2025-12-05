@@ -34,6 +34,19 @@ export interface ProjectBrief {
   industry: string;
   /** Any regulatory requirements */
   regulations?: string[];
+  /** Relevant frameworks, training packages, or competency standards */
+  frameworks?: {
+    /** Framework ID if linked to a project */
+    id?: string;
+    /** Name of framework/training package (e.g., "TLI Transport and Logistics") */
+    name: string;
+    /** Type: "training_package", "asqa_unit", "custom", "uploaded" */
+    type: string;
+    /** Specific units or competencies of interest */
+    units?: string[];
+    /** Notes about relevance */
+    notes?: string;
+  }[];
   /** Additional notes from user clarifications */
   notes?: string;
 }
@@ -186,7 +199,8 @@ export type AgentType =
   | "researcher" 
   | "architect" 
   | "writer" 
-  | "visual_designer";
+  | "visual_designer"
+  | "data_agent";
 
 /**
  * Routing decision made by the orchestrator.
@@ -293,9 +307,12 @@ export const OrchestratorStateAnnotation = Annotation.Root({
     default: () => "orchestrator",
   }),
 
-  /** Tracks which agents have been invoked this session */
+  /** Tracks which agents have been invoked this session (capped at 50 entries) */
   agentHistory: Annotation<AgentType[]>({
-    reducer: (existing, update) => [...(existing || []), ...(update || [])],
+    reducer: (existing, update) => {
+      const combined = [...(existing || []), ...(update || [])];
+      return combined.slice(-50); // Keep only last 50 entries to prevent state explosion
+    },
     default: () => [],
   }),
 
@@ -303,6 +320,18 @@ export const OrchestratorStateAnnotation = Annotation.Root({
   lastError: Annotation<string | null>({
     reducer: (existing, update) => update,
     default: () => null,
+  }),
+
+  // ---- Research Iteration Tracking ----
+
+  /** 
+   * Tracks how many research iterations have been completed.
+   * Used to prevent infinite research loops.
+   * Reset when research is complete or a new research task starts.
+   */
+  researchIterationCount: Annotation<number>({
+    reducer: (existing, update) => update ?? existing,
+    default: () => 0,
   }),
 });
 
@@ -393,7 +422,7 @@ ${findings.bestPractices.map((bp) => `- ${bp}`).join("\n")}
  * Gets a condensed version of the project brief for passing to other agents.
  */
 export function getCondensedBrief(brief: ProjectBrief): string {
-  return `
+  let content = `
 ## Purpose
 ${brief.purpose}
 
@@ -411,7 +440,29 @@ In: ${brief.inScope.join(", ")}
 Out: ${brief.outOfScope.join(", ")}
 
 ## Constraints
-${brief.constraints.map((c) => `- ${c}`).join("\n")}
-`.trim();
+${brief.constraints.map((c) => `- ${c}`).join("\n")}`;
+
+  // Add frameworks if present
+  if (brief.frameworks && brief.frameworks.length > 0) {
+    content += `\n\n## Relevant Frameworks & Standards\n`;
+    content += brief.frameworks.map((f) => {
+      let line = `- **${f.name}** (${f.type})`;
+      if (f.units && f.units.length > 0) {
+        line += `\n  Units: ${f.units.join(", ")}`;
+      }
+      if (f.notes) {
+        line += `\n  Notes: ${f.notes}`;
+      }
+      return line;
+    }).join("\n");
+  }
+
+  // Add regulations if present
+  if (brief.regulations && brief.regulations.length > 0) {
+    content += `\n\n## Regulations\n`;
+    content += brief.regulations.map((r) => `- ${r}`).join("\n");
+  }
+
+  return content.trim();
 }
 

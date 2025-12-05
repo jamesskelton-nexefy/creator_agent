@@ -9,19 +9,16 @@
  * - Uses createAgent from langchain v1 (built on LangGraph internally)
  * - Has access to all frontend tools via CopilotKit state
  * - Provides a simpler, more standard agent loop
- * - Uses interrupt() for frontend tools so CopilotKit can execute them
+ * - Uses custom middleware to intercept frontend tools for CopilotKit auto-execution
  */
 
 import "dotenv/config";
-import { createAgent } from "langchain";
-import { SystemMessage } from "@langchain/core/messages";
+import { createAgent, createMiddleware } from "langchain";
+import { SystemMessage, ToolMessage } from "@langchain/core/messages";
 import { RunnableConfig } from "@langchain/core/runnables";
 import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
-import { DynamicStructuredTool } from "@langchain/core/tools";
-import { convertJsonSchemaToZodSchema } from "@copilotkit/shared";
-import { CopilotKitStateAnnotation } from "@copilotkit/sdk-js/langgraph";
-import { copilotkitCustomizeConfig, copilotKitInterrupt } from "@copilotkit/sdk-js/langgraph";
+import { CopilotKitStateAnnotation, convertActionsToDynamicStructuredTools, copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
 
 // ============================================================================
 // STATE DEFINITION
@@ -40,42 +37,54 @@ const OrchestratorLangchainStateAnnotation = Annotation.Root({
 export type OrchestratorLangchainState = typeof OrchestratorLangchainStateAnnotation.State;
 
 // ============================================================================
-// TOOL CONVERSION - Convert CopilotKit actions to tools that use interrupt
+// FRONTEND TOOL MIDDLEWARE - Intercept frontend tools for CopilotKit execution
 // ============================================================================
 
 /**
- * Converts a CopilotKit action to a DynamicStructuredTool that triggers
- * copilotKitInterrupt when called. This allows the agent to pause and let
- * CopilotKit execute the frontend action in the browser.
+ * Creates middleware that intercepts frontend tool calls and short-circuits
+ * server-side execution. Instead, the tool call is emitted to CopilotKit
+ * which executes it client-side in the browser.
+ * 
+ * This follows the LangChain custom middleware pattern:
+ * https://docs.langchain.com/oss/javascript/langchain/middleware/custom#wrap-style-hooks
+ * 
+ * How it works:
+ * 1. Agent calls a frontend tool (e.g., switchViewMode)
+ * 2. Middleware intercepts via wrapToolCall
+ * 3. Middleware returns placeholder ToolMessage (doesn't execute server-side)
+ * 4. Tool call is emitted to CopilotKit (via emitToolCalls: true)
+ * 5. CopilotKit executes the tool in the browser
+ * 6. CopilotKit sends real ToolMessage result back
+ * 7. Agent continues with actual result
  */
-function convertActionToInterruptingTool(actionInput: any): DynamicStructuredTool<any> {
-  const action = actionInput.type === "function" ? actionInput.function : actionInput;
-  
-  return new DynamicStructuredTool({
-    name: action.name,
-    description: action.description || "",
-    schema: convertJsonSchemaToZodSchema(action.parameters, true),
-    func: async (args: Record<string, any>) => {
-      console.log(`\n[tool:${action.name}] Triggering copilotKitInterrupt with args:`, JSON.stringify(args, null, 2));
+function createFrontendToolMiddleware(frontendToolNames: Set<string>) {
+  return createMiddleware({
+    name: "FrontendToolMiddleware",
+    wrapToolCall: (request, handler) => {
+      // Check if this is a frontend tool that should be executed client-side
+      if (frontendToolNames.has(request.toolCall.name)) {
+        console.log(`[FrontendToolMiddleware] Intercepting frontend tool: ${request.toolCall.name}`);
+        console.log(`[FrontendToolMiddleware] Args:`, JSON.stringify(request.toolCall.args, null, 2));
+        console.log(`[FrontendToolMiddleware] Skipping server execution - CopilotKit will handle this client-side`);
+        
+        // Return placeholder ToolMessage - CopilotKit will execute and provide real result
+        // The tool call is still emitted (via emitToolCalls: true) so CopilotKit sees it
+        return new ToolMessage({
+          content: JSON.stringify({ 
+            pending: true, 
+            executedBy: "copilotkit",
+            note: "This tool is executed client-side by CopilotKit" 
+          }),
+          tool_call_id: request.toolCall.id,
+          name: request.toolCall.name,
+        });
+      }
       
-      // Use copilotKitInterrupt to pause the graph and let CopilotKit execute this tool
-      // in the browser. The graph will resume with the result from the frontend.
-      const { answer } = copilotKitInterrupt({
-        action: action.name,
-        args: args,
-      });
-      
-      console.log(`[tool:${action.name}] Resumed from interrupt with answer:`, answer);
-      return answer ?? "";
+      // For backend tools, execute normally on the server
+      console.log(`[FrontendToolMiddleware] Executing backend tool: ${request.toolCall.name}`);
+      return handler(request);
     },
   });
-}
-
-/**
- * Converts all CopilotKit actions to tools that use copilotKitInterrupt.
- */
-function convertActionsToInterruptingTools(actions: any[]): DynamicStructuredTool<any>[] {
-  return actions.map(action => convertActionToInterruptingTool(action));
 }
 
 // ============================================================================
@@ -173,7 +182,7 @@ You have access to frontend tools that allow you to:
 - Keep the user informed of progress`;
 
 // ============================================================================
-// AGENT NODE - Uses LangChain createAgent internally
+// AGENT NODE - Uses LangChain createAgent with custom middleware
 // ============================================================================
 
 async function orchestratorNode(
@@ -187,22 +196,31 @@ async function orchestratorNode(
   const frontendActions = state.copilotkit?.actions ?? [];
   console.log("  Available frontend actions:", frontendActions.length);
   
-  // Convert CopilotKit actions to tools that trigger copilotKitInterrupt
-  // This is the key: each tool's func() calls copilotKitInterrupt to pause
-  // the graph and let the frontend execute the action
-  const interruptingTools = convertActionsToInterruptingTools(frontendActions);
-  console.log("  Converted to interrupting tools:", interruptingTools.map(t => t.name).join(", ") || "none");
+  // Build set of frontend tool names for the middleware
+  const frontendToolNames = new Set(
+    frontendActions.map((action: any) => {
+      const a = action.type === "function" ? action.function : action;
+      return a.name;
+    })
+  );
+  console.log("  Frontend tool names:", Array.from(frontendToolNames).join(", ") || "none");
+
+  // Convert CopilotKit actions to DynamicStructuredTools
+  // These tools don't need to do anything server-side - the middleware handles them
+  const frontendTools = convertActionsToDynamicStructuredTools(frontendActions);
+  console.log("  Converted to tools:", frontendTools.map(t => t.name).join(", ") || "none");
 
   // Customize config to emit tool calls for CopilotKit
+  // This is essential - it tells CopilotKit about the tool calls so it can execute them
   const customConfig = copilotkitCustomizeConfig(config, {
     emitToolCalls: true,
   });
 
-  // Create the agent using LangChain's createAgent
-  // Tools will trigger copilotKitInterrupt when called
+  // Create the agent using LangChain's createAgent with custom middleware
+  // The middleware intercepts frontend tools and short-circuits server execution
   const agent = createAgent({
     model: "anthropic:claude-sonnet-4-20250514",
-    tools: interruptingTools,
+    tools: frontendTools,
     systemPrompt: new SystemMessage({
       content: [
         {
@@ -213,9 +231,10 @@ async function orchestratorNode(
         },
       ],
     }),
+    middleware: [createFrontendToolMiddleware(frontendToolNames)],
   });
 
-  console.log("  Invoking createAgent with frontend tool middleware...");
+  console.log("  Invoking createAgent with FrontendToolMiddleware...");
 
   try {
     // Invoke the agent with the current messages
@@ -286,5 +305,4 @@ export const agent = workflow.compile({
 });
 
 console.log("[orchestrator-langchain] Workflow graph compiled successfully");
-console.log("[orchestrator-langchain] Using LangChain createAgent pattern");
-
+console.log("[orchestrator-langchain] Using LangChain createAgent with FrontendToolMiddleware");

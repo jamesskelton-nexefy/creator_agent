@@ -195,27 +195,29 @@ export function filterOrphanedToolResults(
           );
         }
 
-        // If we have resolved tool_calls, create a new AI message with only those
-        // This preserves the tool_use for tool_results that exist
+        // If we have resolved tool_calls, create a sanitized AI message
+        // CRITICAL: Always create a new message to avoid duplicate tool_use IDs.
+        // Claude returns AI messages with tool_use in BOTH content AND tool_calls.
+        // If we pass the original, LangChain serializes both - causing Anthropic API errors.
         if (resolvedToolCalls.length > 0) {
+          // Always create new AI message with only tool_calls (no content)
+          // This prevents duplicate tool_use IDs when serialized for Anthropic
+          const newAiMsg = new AIMessage({
+            content: "",  // Let LangChain handle content reconstruction from tool_calls
+            tool_calls: resolvedToolCalls,
+            id: aiMsg.id,
+            name: aiMsg.name,
+          });
+          filtered.push(newAiMsg);
+          
           if (unresolvedToolCalls.length > 0) {
-            // Create new AI message with only resolved tool_calls
-            // IMPORTANT: Don't copy aiMsg.content - with Anthropic, content contains
-            // tool_use blocks that would duplicate with tool_calls when serialized.
-            // Let LangChain rebuild content from tool_calls to avoid duplicate IDs.
-            const newAiMsg = new AIMessage({
-              content: "",  // Let LangChain handle content reconstruction from tool_calls
-              tool_calls: resolvedToolCalls,
-              id: aiMsg.id,
-              name: aiMsg.name,
-            });
-            filtered.push(newAiMsg);
             console.log(
-              `  ${prefix}[FILTER] Kept AI message with ${resolvedToolCalls.length} resolved tool_calls (content cleared to avoid duplicate tool_use IDs)`
+              `  ${prefix}[FILTER] Sanitized AI message: ${resolvedToolCalls.length} resolved, ${unresolvedToolCalls.length} unresolved tool_calls removed`
             );
           } else {
-            // All tool_calls are resolved, keep the original
-            filtered.push(msg);
+            console.log(
+              `  ${prefix}[FILTER] Sanitized AI message with ${resolvedToolCalls.length} tool_calls (cleared content to prevent duplicate tool_use IDs)`
+            );
           }
           continue;
         }

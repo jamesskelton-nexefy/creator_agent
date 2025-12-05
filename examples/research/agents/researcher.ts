@@ -19,7 +19,7 @@ import { tool } from "@langchain/core/tools";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { z } from "zod";
 import OpenAI from "openai";
-import { createDocumentService, DocumentService } from "../../../src/documents/index";
+import { createDocumentService, DocumentService } from "../lib/documents";
 import type { OrchestratorState, ResearchBrief } from "../state/agent-state";
 import { getCondensedBrief } from "../state/agent-state";
 

@@ -17,7 +17,13 @@ const app = express();
 app.use(cors({
   origin: ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:3000', 'http://127.0.0.1:5173'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-copilotkit-runtime-client-gql-version',
+    'x-copilotkit-thread-id',
+    'x-copilotkit-run-id',
+  ],
 }));
 
 // Parse JSON bodies - increased limit for large CopilotKit payloads
@@ -322,8 +328,8 @@ if (!USE_LOCAL_LANGGRAPH && !LANGSMITH_API_KEY) {
   console.warn('[WARNING] LANGSMITH_API_KEY not set - cloud deployment may fail authentication');
 }
 
-// Select which orchestrator to use: 'orchestrator' (LangGraph) or 'orchestrator_langchain' (createAgent)
-const ORCHESTRATOR_AGENT = process.env.ORCHESTRATOR_AGENT || 'orchestrator';
+// Select which orchestrator to use
+const ORCHESTRATOR_AGENT = process.env.ORCHESTRATOR_AGENT || 'orchestrator_deep';
 
 console.log('[√] Configuring CopilotKit agents...');
 console.log(`    [AGENT LOCK MODE] Locked to: ${ORCHESTRATOR_AGENT}`);
@@ -332,52 +338,24 @@ console.log(`    Agent: ${ORCHESTRATOR_AGENT} @ ${LANGGRAPH_URL}`);
 
 app.use('/copilotkit', (req, res, next) => {
   // ============================================================================
-  // MULTI-AGENT ORCHESTRATOR MODE
+  // DEEP AGENT ORCHESTRATOR MODE
   // ============================================================================
-  // CopilotKit is configured to work with the orchestrator agent which
-  // coordinates specialized sub-agents: Strategist, Researcher, Architect,
-  // Writer, and Visual Designer.
+  // CopilotKit is configured to work with the orchestrator_deep agent which
+  // uses langchain createAgent with SubAgentMiddleware for subagent delegation.
+  // The frontend-actions subagent handles all CopilotKit frontend tools.
   // ============================================================================
   const runtime = new CopilotRuntime({
-    // =========================================================================
-    // AGENT LOCK MODE - Force ALL requests through the orchestrator agent
-    // =========================================================================
-    // The orchestrator coordinates between specialized sub-agents:
-    // - Strategist: Requirements gathering
-    // - Researcher: Deep knowledge gathering  
-    // - Architect: Course structure design
-    // - Writer: Content creation
-    // - Visual Designer: Aesthetics and tone
-    // =========================================================================
     agentLock: ORCHESTRATOR_AGENT,
     agents: {
-      'orchestrator': new LangGraphAgent({
+      'orchestrator_deep': new LangGraphAgent({
         deploymentUrl: LANGGRAPH_URL,
         langsmithApiKey: LANGSMITH_API_KEY,
-        graphId: 'orchestrator',
-        description: `Multi-agent orchestrator for creating impactful online training:
-- Coordinates specialized sub-agents for different tasks
-- Strategist: Discovers purpose, objectives, scope
-- Researcher: Gathers deep knowledge on topics
-- Architect: Designs course structure
-- Writer: Creates Level 6 content nodes
-- Visual Designer: Defines aesthetics and tone`,
-        // Note: LangGraph Platform API accepts both snake_case and camelCase
-        // Including both for compatibility
-        config: {
-          recursion_limit: 150,
-          recursionLimit: 150,
-        },
-      }),
-      'orchestrator_langchain': new LangGraphAgent({
-        deploymentUrl: LANGGRAPH_URL,
-        langsmithApiKey: LANGSMITH_API_KEY,
-        graphId: 'orchestrator_langchain',
-        description: `LangChain createAgent orchestrator - a simpler agent implementation:
-- Uses LangChain v1 createAgent pattern
-- Standard ReAct agent loop with automatic tool handling
-- Access to all frontend tools for project/node management
-- May provide more stable tool handling than custom LangGraph`,
+        graphId: 'orchestrator_deep',
+        description: `Deep Agent orchestrator using langchain createAgent with SubAgentMiddleware:
+- Uses deepagents pattern with subagent delegation via task() tool
+- frontend-actions subagent handles all CopilotKit frontend tools
+- Context isolation keeps main agent clean
+- Supports navigation, project/node management, table view, documents, media`,
         config: {
           recursion_limit: 150,
           recursionLimit: 150,
@@ -447,14 +425,10 @@ app.listen(4000, () => {
   console.log('='.repeat(60));
   console.log('  URL: http://localhost:4000/copilotkit');
   console.log(`  Active Agent: ${ORCHESTRATOR_AGENT}`);
-  if (ORCHESTRATOR_AGENT === 'orchestrator') {
-    console.log('  Sub-agents: strategist, researcher, architect, writer, visual_designer');
-  } else {
-    console.log('  Mode: LangChain createAgent (simpler ReAct loop)');
-  }
+  console.log('  Pattern: Deep Agent with SubAgentMiddleware');
+  console.log('  Sub-agent: frontend-actions (CopilotKit tools)');
   console.log(`  LangGraph: ${LANGGRAPH_URL}`);
   console.log(`  Mode: ${USE_LOCAL_LANGGRAPH ? 'LOCAL' : 'LANGSMITH CLOUD'}`);
   console.log('  Model: claude-sonnet-4-20250514');
-  console.log('  [TIP] Set ORCHESTRATOR_AGENT=orchestrator_langchain to use createAgent version');
   console.log('='.repeat(60) + '\n');
 });

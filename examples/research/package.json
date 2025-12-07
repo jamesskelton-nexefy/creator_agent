@@ -5,7 +5,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "tsx orchestrator-agent.ts"
+    "start": "tsx orchestrator-agent.ts",
+    "test:langchain": "tsx test-langchain-agent.ts"
   },
   "dependencies": {
     "@copilotkit/runtime": "^1.10.6",
@@ -18,6 +19,7 @@
     "@langchain/openai": "^0.3.0",
     "@langchain/textsplitters": "^0.1.0",
     "@supabase/supabase-js": "^2.58.0",
+    "deepagents": "^1.3.0",
     "dotenv": "^17.2.3",
     "langchain": "^1.0.0",
     "mammoth": "^1.8.0",
@@ -31,4 +33,3 @@
     "typescript": "^5.9.2"
   }
 }
-

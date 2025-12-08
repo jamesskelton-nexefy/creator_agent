@@ -23,7 +23,7 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, CourseStructure, PlannedNode } from "../state/agent-state";
+import type { OrchestratorState, CourseStructure, PlannedNode, PlannedStructure, CreatedNode } from "../state/agent-state";
 import { getCondensedBrief, getCondensedResearch } from "../state/agent-state";
 
 // Centralized context management utilities
@@ -62,12 +62,65 @@ You CREATE the structural framework of courses by building nodes at Levels 2-5:
 
 **IMPORTANT**: You do NOT write the final content (Level 6 content blocks). That's the Writer's job. You build the skeleton; they fill in the content.
 
-## What You Do
+## TWO-PHASE PROCESS
 
-1. **Understand Structure** - Use tools to see hierarchy config and existing nodes
-2. **Design Structure** - Plan modules, lessons, topics based on brief and research
-3. **Create Nodes** - Actually BUILD the structure by creating nodes in the system
-4. **Organize Flow** - Ensure logical progression and parent-child relationships
+You work in two distinct phases to ensure plans survive interruptions:
+
+### PHASE 1: PLANNING (Output plan BEFORE creating anything)
+
+1. Understand the hierarchy and templates available
+2. Design the complete structure based on brief and research
+3. **OUTPUT YOUR PLAN AS JSON** with the marker \`[PLAN READY]\`
+
+The plan is saved to state and can be resumed if interrupted!
+
+### PHASE 2: EXECUTION (Create nodes from the plan)
+
+1. Request edit mode
+2. Create nodes ONE AT A TIME from your plan
+3. Track progress - note which nodes are created
+4. Release edit mode when complete
+5. Mark \`[STRUCTURE COMPLETE]\` when done
+
+## PLAN OUTPUT FORMAT
+
+Before creating ANY nodes, output your complete plan:
+
+\`\`\`json
+{
+  "summary": "Brief description of the course structure",
+  "rationale": "Why this structure works for the learning objectives",
+  "nodes": [
+    {
+      "tempId": "mod-1",
+      "title": "Module 1: Introduction",
+      "nodeType": "module",
+      "level": 2,
+      "parentTempId": null,
+      "description": "Overview and foundations",
+      "orderIndex": 0
+    },
+    {
+      "tempId": "les-1-1",
+      "title": "What is Risk?",
+      "nodeType": "lesson",
+      "level": 3,
+      "parentTempId": "mod-1",
+      "description": "Basic risk concepts",
+      "orderIndex": 0
+    }
+  ]
+}
+\`\`\`
+[PLAN READY]
+
+## RESUMING FROM INTERRUPTION
+
+If you see existing plannedStructure or createdNodes in the context:
+1. **DO NOT recreate** nodes that already exist
+2. Check which tempIds have already been executed
+3. Continue from where you left off
+4. Skip nodes that match existing createdNodes by title/parent
 
 ## Your Tools
 
@@ -87,16 +140,6 @@ You CREATE the structural framework of courses by building nodes at Levels 2-5:
 - **getNodeChildren** - Check children of specific nodes
 - **getNodeDetails** - Get detailed node information
 
-## Building Process
-
-1. **Request Edit Mode** - Always start by requesting edit access
-2. **Check Hierarchy** - Use getProjectHierarchyInfo to understand levels
-3. **Review Templates** - Use getAvailableTemplates to see what can be created
-4. **Create Level 2 First** - Build modules (major sections)
-5. **Create Level 3 Under Each** - Build lessons within modules
-6. **Continue Down** - Add sub-topics and activities as needed
-7. **Release Edit Mode** - When structure is complete
-
 ## Design Principles
 
 1. **Chunking** - 5-7 items per parent (not too many children)
@@ -110,28 +153,16 @@ You CREATE the structural framework of courses by building nodes at Levels 2-5:
 When creating nodes:
 - Create ONE node at a time - wait for success before proceeding
 - Start with Level 2 (modules) - they have no parent
-- For Level 3+, always specify the parentNodeId
+- For Level 3+, always specify the parentNodeId from a CREATED node
 - Use descriptive titles
 - Match node types to templates available at each level
-
-## Example Flow
-
-\`\`\`
-1. requestEditMode
-2. getProjectHierarchyInfo (understand levels)
-3. getAvailableTemplates (see Level 2 options)
-4. createNode: "Introduction to Risk Management" (Level 2, module)
-5. createNode: "Understanding Risk" (Level 3, lesson, parent=above)
-6. createNode: "Types of Risk" (Level 3, lesson, parent=module)
-7. ... continue building structure
-8. releaseEditMode
-\`\`\`
 
 ## What NOT To Do
 
 - Do NOT create Level 6 content blocks - that's the Writer's job
 - Do NOT fill in detailed content fields - just structure
 - Do NOT create too many nodes at once - build systematically
+- Do NOT skip the planning phase - always output [PLAN READY] first
 
 Remember: A well-structured course makes the difference between forgettable training and transformative learning. Build the skeleton that the Writer will bring to life.`;
 
@@ -191,8 +222,40 @@ export async function architectNode(
     systemContent += `\n\n## Research Findings\n\n${condensedResearch}`;
   }
 
-  // Include existing structure if any
-  if (state.courseStructure) {
+  // Include existing PLANNED structure for resumption (critical for crash recovery)
+  if (state.plannedStructure) {
+    const executed = Object.keys(state.plannedStructure.executedNodes || {}).length;
+    const total = state.plannedStructure.nodes.length;
+    const remaining = state.plannedStructure.nodes.filter(
+      n => !state.plannedStructure!.executedNodes[n.tempId]
+    );
+    
+    systemContent += `\n\n## RESUMING FROM EXISTING PLAN
+    
+**Status**: ${state.plannedStructure.executionStatus} (${executed}/${total} nodes created)
+
+**Your plan is already saved. DO NOT output a new [PLAN READY].**
+
+**Remaining nodes to create:**
+${remaining.map(n => `- ${n.tempId}: "${n.title}" (${n.nodeType}, level ${n.level})`).join('\n')}
+
+**Already created (tempId → nodeId):**
+${Object.entries(state.plannedStructure.executedNodes).map(([tempId, nodeId]) => `- ${tempId} → ${nodeId}`).join('\n') || '(none yet)'}
+
+Continue creating the remaining nodes. Use the actual nodeId (not tempId) when specifying parentNodeId for children.`;
+  }
+
+  // Include existing created nodes for duplicate prevention
+  if (state.createdNodes && state.createdNodes.length > 0) {
+    systemContent += `\n\n## Already Created Nodes (DO NOT recreate)
+    
+${state.createdNodes.map(n => `- "${n.title}" (nodeId: ${n.nodeId}, template: ${n.templateName})`).join('\n')}
+
+Check this list before creating any node to avoid duplicates.`;
+  }
+
+  // Include existing FINAL structure if any (for refinement)
+  if (state.courseStructure && !state.plannedStructure) {
     systemContent += `\n\n## Existing Structure (to refine)\n
 Current structure has ${state.courseStructure.totalNodes} nodes across ${state.courseStructure.maxDepth} levels.
 Summary: ${state.courseStructure.summary}
@@ -258,12 +321,100 @@ The user is waiting for you to build the course structure.`,
     }
   }
 
+  // Extract response text for parsing
+  const responseText = typeof aiResponse.content === "string"
+    ? aiResponse.content
+    : Array.isArray(aiResponse.content)
+    ? aiResponse.content
+        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    : "";
+
+  // Check for PLAN READY marker (Phase 1 output)
+  const isPlanReady = responseText.toLowerCase().includes("[plan ready]");
+  
+  // Check for structure completion markers (Phase 2 complete)
+  const isStructureComplete = responseText.toLowerCase().includes("[structure complete]") ||
+    responseText.toLowerCase().includes("[done]");
+  
+  // Parse planned structure on [PLAN READY]
+  let parsedPlannedStructure: PlannedStructure | null = null;
+  if (isPlanReady && !state.plannedStructure) {
+    console.log("  [architect] Plan ready detected - parsing planned structure");
+    parsedPlannedStructure = parsePlannedStructure(responseText);
+    if (parsedPlannedStructure) {
+      console.log("  [architect] Parsed planned structure:", {
+        totalNodes: parsedPlannedStructure.totalNodes,
+        maxDepth: parsedPlannedStructure.maxDepth,
+        summary: parsedPlannedStructure.summary?.substring(0, 50) + "...",
+      });
+    } else {
+      console.log("  [architect] WARNING: Could not parse planned structure from response");
+    }
+  }
+
+  // Parse course structure on completion
+  let parsedStructure: CourseStructure | null = null;
+  if (isStructureComplete) {
+    console.log("  [architect] Structure completion detected - parsing final course structure");
+    parsedStructure = parseCourseStructure(responseText);
+    if (parsedStructure) {
+      console.log("  [architect] Parsed course structure:", {
+        totalNodes: parsedStructure.totalNodes,
+        maxDepth: parsedStructure.maxDepth,
+        summary: parsedStructure.summary?.substring(0, 50) + "...",
+      });
+    }
+  }
+
+  // Extract created nodes from tool call results
+  const newCreatedNodes = extractCreatedNodesFromToolCalls(aiResponse, state.messages || []);
+  if (newCreatedNodes.length > 0) {
+    console.log("  [architect] Extracted created nodes:", newCreatedNodes.map(n => n.title).join(", "));
+  }
+
+  // Update plannedStructure execution tracking if we have new created nodes
+  let updatedPlannedStructure: PlannedStructure | null = null;
+  if (state.plannedStructure && newCreatedNodes.length > 0) {
+    const newExecutedNodes: Record<string, string> = {};
+    for (const created of newCreatedNodes) {
+      // Match by title to find the tempId
+      const matchingPlanned = state.plannedStructure.nodes.find(
+        n => n.title.toLowerCase() === created.title.toLowerCase()
+      );
+      if (matchingPlanned) {
+        newExecutedNodes[matchingPlanned.tempId] = created.nodeId;
+      }
+    }
+    
+    if (Object.keys(newExecutedNodes).length > 0) {
+      const allExecuted = { ...state.plannedStructure.executedNodes, ...newExecutedNodes };
+      const totalPlanned = state.plannedStructure.nodes.length;
+      const totalExecuted = Object.keys(allExecuted).length;
+      
+      updatedPlannedStructure = {
+        ...state.plannedStructure,
+        executedNodes: allExecuted,
+        executionStatus: totalExecuted >= totalPlanned ? "completed" : "in_progress",
+      };
+      console.log(`  [architect] Updated plan execution: ${totalExecuted}/${totalPlanned} nodes`);
+    }
+  }
+
   return {
     messages: [response],
     currentAgent: "architect",
     agentHistory: ["architect"],
-    // Clear routing decision when this agent starts - prevents stale routing
     routingDecision: null,
+    // Include parsed planned structure if available (Phase 1)
+    ...(parsedPlannedStructure && { plannedStructure: parsedPlannedStructure }),
+    // Include updated planned structure execution tracking
+    ...(updatedPlannedStructure && { plannedStructure: updatedPlannedStructure }),
+    // Include parsed course structure if available (Phase 2 complete)
+    ...(parsedStructure && { courseStructure: parsedStructure }),
+    // Include new created nodes
+    ...(newCreatedNodes.length > 0 && { createdNodes: newCreatedNodes }),
   };
 }
 
@@ -309,6 +460,87 @@ function validatePlannedNode(input: Partial<PlannedNode>, index: number): Planne
     objectives: input.objectives,
     orderIndex: input.orderIndex ?? index,
   };
+}
+
+/**
+ * Parses an architect's [PLAN READY] response to extract planned structure.
+ * This is the pre-creation plan that can be resumed if interrupted.
+ */
+export function parsePlannedStructure(content: string): PlannedStructure | null {
+  try {
+    // Look for JSON block before [PLAN READY]
+    const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[1]);
+      const nodes = (parsed.nodes || []).map((n: Partial<PlannedNode>, idx: number) => validatePlannedNode(n, idx));
+      
+      return {
+        summary: parsed.summary || "Course structure plan",
+        rationale: parsed.rationale || "",
+        nodes,
+        totalNodes: nodes.length,
+        maxDepth: Math.max(...nodes.map((n: PlannedNode) => n.level), 2),
+        plannedAt: new Date().toISOString(),
+        executionStatus: "planned",
+        executedNodes: {},
+      };
+    }
+    return null;
+  } catch (error) {
+    console.error("[architect] Failed to parse planned structure:", error);
+    return null;
+  }
+}
+
+/**
+ * Extracts created node information from tool call results in the message history.
+ * Looks for successful createNode tool calls and their results.
+ */
+function extractCreatedNodesFromToolCalls(aiResponse: AIMessage, messages: BaseMessage[]): CreatedNode[] {
+  const createdNodes: CreatedNode[] = [];
+  
+  // Look for createNode tool calls in the current response
+  const createNodeCalls = aiResponse.tool_calls?.filter(tc => tc.name === "createNode") || [];
+  
+  if (createNodeCalls.length === 0) {
+    return createdNodes;
+  }
+
+  // Find corresponding tool results in recent messages
+  for (const toolCall of createNodeCalls) {
+    const toolCallId = toolCall.id;
+    if (!toolCallId) continue;
+
+    // Look for the tool result in messages
+    for (const msg of messages) {
+      const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || '';
+      if (msgType === 'tool' || msgType === 'ToolMessage') {
+        const toolMsg = msg as any;
+        if (toolMsg.tool_call_id === toolCallId) {
+          try {
+            // Parse the tool result to extract node info
+            const content = typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content);
+            
+            // Look for nodeId in the result
+            const nodeIdMatch = content.match(/nodeId['":\s]+['"]?([a-zA-Z0-9-]+)/);
+            if (nodeIdMatch) {
+              const args = toolCall.args as { title?: string; parentNodeId?: string; templateName?: string };
+              createdNodes.push({
+                nodeId: nodeIdMatch[1],
+                title: args.title || 'Unknown',
+                parentNodeId: args.parentNodeId || null,
+                templateName: args.templateName || 'unknown',
+              });
+            }
+          } catch (e) {
+            // Ignore parsing errors
+          }
+        }
+      }
+    }
+  }
+
+  return createdNodes;
 }
 
 /**

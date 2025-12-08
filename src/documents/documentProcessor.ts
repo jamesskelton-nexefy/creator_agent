@@ -215,3 +215,4 @@ export function isValidDocumentType(mimeType: string): boolean {
   return getFileTypeFromMime(mimeType) !== null;
 }
 
+

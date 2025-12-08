@@ -18,7 +18,8 @@
 import "dotenv/config";
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
-import { START, StateGraph, END } from "@langchain/langgraph";
+import { StructuredToolInterface } from "@langchain/core/tools";
+import { START, StateGraph, END, Command } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
@@ -34,131 +35,55 @@ import {
 
 // Centralized context management utilities
 import {
-  filterOrphanedToolResults,
-  trimMessages,
-  summarizeIfNeeded,
+  processContext,
   MESSAGE_LIMITS,
   TOKEN_LIMITS,
 } from "./utils";
 
 import {
+  // Creative workflow agents
   strategistNode,
-  parseProjectBrief as _parseProjectBrief,
+  parseProjectBrief,
   researcherNode,
   researcherTools,
-  parseResearchFindings as _parseResearchFindings,
+  parseResearchFindings,
   architectNode,
-  parseCourseStructure as _parseCourseStructure,
+  parseCourseStructure,
   writerNode,
-  extractContentOutput as _extractContentOutput,
+  extractContentOutput,
   visualDesignerNode,
-  parseVisualDesign as _parseVisualDesign,
+  parseVisualDesign,
+  // Tool-specialized sub-agents
   dataAgentNode,
+  projectAgentNode,
+  nodeAgentNode,
+  documentAgentNode,
+  mediaAgentNode,
+  frameworkAgentNode,
 } from "./agents/index";
 
 // Re-export parsing utilities for external use
 export {
-  _parseProjectBrief as parseProjectBrief,
-  _parseResearchFindings as parseResearchFindings,
-  _parseCourseStructure as parseCourseStructure,
-  _extractContentOutput as extractContentOutput,
-  _parseVisualDesign as parseVisualDesign,
+  parseProjectBrief,
+  parseResearchFindings,
+  parseCourseStructure,
+  extractContentOutput,
+  parseVisualDesign,
 };
 
 // Message filtering and trimming now handled by centralized utils/context-management.ts
 
 // ============================================================================
-// FRONTEND TOOL DETECTION - Identify frontend vs backend tool messages
+// DEBUG CONFIGURATION
 // ============================================================================
 
-/**
- * Checks if a message is a ToolMessage (tool_result) from a frontend tool.
- * Frontend tools are any tools NOT in the researcherTools list (backend tools).
- * 
- * Used to keep the graph alive when frontend tools are called - we wait for
- * CopilotKit to send the tool_result back instead of ending the graph.
- * 
- * Note: Prefixed with underscore as it's available for future use but not currently needed.
- * The routing logic uses isToolResultMessage() which is sufficient since backend tool
- * results go through execute_backend_tools node with its own routing.
- */
-function _isFrontendToolResult(msg: BaseMessage): boolean {
-  const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
-  if (msgType !== "tool" && msgType !== "ToolMessage") return false;
+/** Enable verbose debug logging via DEBUG_ORCHESTRATOR env var */
+const DEBUG = process.env.DEBUG_ORCHESTRATOR === "true";
 
-  const toolMsg = msg as ToolMessage;
-  const backendToolNames = new Set(researcherTools.map((t) => t.name));
-  
-  // It's a frontend tool result if the tool name is NOT in backend tools
-  return !backendToolNames.has(toolMsg.name || "");
-}
-
-/**
- * Checks if the last message in state is a ToolMessage (tool_result).
- * Used to detect when CopilotKit has sent back a tool result.
- * 
- * Note: Prefixed with underscore as it's available for future use but not currently needed.
- */
-function _isToolResultMessage(msg: BaseMessage): boolean {
-  const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
-  return msgType === "tool" || msgType === "ToolMessage";
-}
-
-/**
- * Checks if there's a pending uploadDocument action in the recent messages.
- * Returns "document_upload" if the uploadDocument tool was called and returned
- * a prompt to upload (not an actual upload completion).
- * Returns null if no pending upload or if upload is complete.
- */
-function detectPendingUpload(messages: BaseMessage[]): string | null {
-  // Look through recent messages for uploadDocument tool patterns
-  const recentMessages = messages.slice(-10);
-  
-  let hasUploadPrompt = false;
-  let hasUploadCompletion = false;
-  
-  for (const msg of recentMessages) {
-    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
-    
-    if (msgType === "tool" || msgType === "ToolMessage") {
-      const toolMsg = msg as ToolMessage;
-      
-      // Check if this is an uploadDocument result
-      if (toolMsg.name === "uploadDocument") {
-        try {
-          const content = typeof toolMsg.content === "string" ? toolMsg.content : JSON.stringify(toolMsg.content);
-          const parsed = JSON.parse(content);
-          
-          // If the tool returned success with a "please upload" message, it's a prompt
-          if (parsed.success && (parsed.message?.includes("upload") || parsed.note?.includes("Click"))) {
-            hasUploadPrompt = true;
-          }
-          
-          // If there's a documentId, the upload is complete
-          if (parsed.documentId) {
-            hasUploadCompletion = true;
-          }
-        } catch {
-          // If we can't parse, check for keywords in raw content
-          const content = typeof toolMsg.content === "string" ? toolMsg.content : "";
-          if (content.includes("Please upload") || content.includes("select a file")) {
-            hasUploadPrompt = true;
-          }
-          if (content.includes("documentId")) {
-            hasUploadCompletion = true;
-          }
-        }
-      }
-    }
-  }
-  
-  // If there's a prompt but no completion, we're waiting for upload
-  if (hasUploadPrompt && !hasUploadCompletion) {
-    return "document_upload";
-  }
-  
-  return null;
-}
+/** Conditional debug logger - only logs when DEBUG is enabled */
+const debugLog = DEBUG 
+  ? (...args: any[]) => console.log(...args)
+  : () => {};
 
 // ============================================================================
 // MODEL CONFIGURATION
@@ -174,6 +99,84 @@ const orchestratorModel = new ChatAnthropic({
     defaultHeaders: { "anthropic-beta": "prompt-caching-2024-07-31" },
   },
 });
+
+// ============================================================================
+// TABLE TOOLS EXCLUSION - Tools handled by Data Agent
+// ============================================================================
+
+/**
+ * Table-specific tools that should be routed to the Data Agent, not handled by supervisor.
+ * switchViewMode is kept for basic navigation, but table operations go to data_agent.
+ */
+const TABLE_TOOLS_FOR_DATA_AGENT = new Set([
+  "switchTableViewMode",
+  "getTableViewState",
+  "getTableFilterOptions",
+  "addTableFilter",
+  "clearTableFilters",
+  "addTableSort",
+  "clearTableSorts",
+  "setTableGrouping",
+  "clearTableGrouping",
+  "getTableColumns",
+  "showTableColumn",
+  "hideTableColumn",
+  "exportTableData",
+  "listTableViews",
+  "saveTableView",
+  "loadTableView",
+  "deleteTableView",
+  "searchTable",
+  "getTableDataSummary",
+  "getFieldValueDistribution",
+]);
+
+// ============================================================================
+// SUPERVISOR ROUTING TOOL
+// ============================================================================
+
+/**
+ * Tool used by the supervisor (orchestrator) to structure responses and route to sub-agents.
+ * Following CopilotKit supervisor pattern for multi-agent coordination.
+ */
+const SUPERVISOR_ROUTING_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "supervisor_response",
+    description: "Always use this tool to structure your response and optionally route to a specialized agent.",
+    parameters: {
+      type: "object",
+      properties: {
+        answer: {
+          type: "string",
+          description: "Your response to the user"
+        },
+        next_agent: {
+          type: "string",
+          enum: [
+            // Creative workflow agents
+            "strategist",
+            "researcher", 
+            "architect",
+            "writer",
+            "visual_designer",
+            // Tool-specialized sub-agents
+            "project_agent",
+            "node_agent",
+            "data_agent",
+            "document_agent",
+            "media_agent",
+            "framework_agent",
+            // Complete (no routing)
+            "complete"
+          ],
+          description: "The specialized agent to route to. Use 'complete' if no routing is needed."
+        }
+      },
+      required: ["answer"]
+    }
+  }
+};
 
 // ============================================================================
 // ORCHESTRATOR SYSTEM PROMPT
@@ -443,6 +446,57 @@ When a user message arrives:
 - User says "work on visual design" → Then involve Visual Designer
 - User says "show table view" or "filter data" → Then involve Data Agent
 
+## CRITICAL: Handling offerOptions Selections
+
+**When \`offerOptions\` returns "User selected: X", that IS the user's explicit instruction. ACT ON IT IMMEDIATELY.**
+
+The tool result from \`offerOptions\` is how users click buttons in the UI. When you receive:
+\`\`\`
+"User selected: \"Design the Course Structure\"..."
+\`\`\`
+
+This is IDENTICAL to the user typing "design the course structure". You MUST:
+1. Acknowledge the selection briefly
+2. Route to the appropriate specialist immediately using \`supervisor_response\` with the correct \`next_agent\`
+
+**Mapping offerOptions selections to routing:**
+- Selection contains "Design the Course Structure" or "Architect" → \`next_agent: "architect"\`
+- Selection contains "Visual Design" or "Designer" → \`next_agent: "visual_designer"\`
+- Selection contains "Research" or "Researcher" → \`next_agent: "researcher"\`
+- Selection contains "Requirements" or "Strategy" or "Strategist" → \`next_agent: "strategist"\`
+- Selection contains "Write" or "Content" or "Writer" → \`next_agent: "writer"\`
+- Selection contains "Table" or "Data" → \`next_agent: "data_agent"\`
+
+**DO NOT** respond to an offerOptions selection by:
+- Providing another summary
+- Offering more options
+- Using \`next_agent: "complete"\`
+
+The user already made their choice. Execute it.
+
+## State vs Memory - When to Use Each
+
+**Agent State** (automatic, within-session):
+- projectBrief, researchFindings, plannedStructure, courseStructure, visualDesign
+- Automatically passed between agents - you don't need to save these
+- Populated when agents complete their work and output structured data
+- plannedStructure tracks architect's plan + execution progress (survives restarts)
+
+**Memory Tools** (persistent, cross-session):
+- saveMemory: ONLY for user preferences or AFTER project completion
+- recallMemories: To retrieve past preferences or historical project info
+
+**NEVER use saveMemory for:**
+- Project briefs (state handles this)
+- Research findings (state handles this)
+- Course structures (state handles this)
+- Any mid-workflow data
+
+**DO use saveMemory for:**
+- User preferences ("I prefer simple language", "I like dark themes")
+- Historical project summaries AFTER completion
+- Facts about the user that should persist across sessions
+
 ## Guidelines
 
 - **ALWAYS use offerOptions or askClarifyingQuestions tools** when presenting choices - never just write options as text
@@ -459,14 +513,23 @@ When a user message arrives:
 This section will be updated with the current state of agent outputs.`;
 
 // ============================================================================
-// ORCHESTRATOR NODE
+// SUPERVISOR (ORCHESTRATOR) NODE - CopilotKit Supervisor Pattern
 // ============================================================================
 
-async function orchestratorNode(
+/**
+ * Supervisor agent that coordinates specialized sub-agents.
+ * Uses Command pattern for routing instead of conditional edges.
+ * 
+ * Follows CopilotKit multi-agent supervisor pattern:
+ * - Binds SUPERVISOR_ROUTING_TOOL for structured routing decisions
+ * - Returns Command({ goto: next_agent }) for routing
+ * - Returns Command({ goto: END }) when waiting for user/tool results
+ */
+async function supervisorNode(
   state: OrchestratorState,
   config: RunnableConfig
-): Promise<Partial<OrchestratorState>> {
-  console.log("\n[orchestrator] ============ Orchestrator Agent ============");
+): Promise<Command> {
+  console.log("\n[supervisor] ============ Supervisor Agent ============");
   console.log("  Agent context:", summarizeAgentContext(state));
   console.log("  Messages count:", state.messages?.length ?? 0);
   console.log("  Current agent:", state.currentAgent);
@@ -497,51 +560,47 @@ async function orchestratorNode(
         if (unresolvedCalls.length > 0) {
           console.log(`  [SAFETY] Last message has ${unresolvedCalls.length} unresolved tool_calls: ${unresolvedCalls.map(tc => tc.name).join(", ")}`);
           console.log("  [SAFETY] Waiting for tool_result from CopilotKit - skipping LLM invocation");
-          // Return without changes - the graph should route to END and wait for tool_result
-          return {
-            currentAgent: "orchestrator",
-          };
+          // Return Command to END - wait for CopilotKit to send tool_result
+          return new Command({
+            goto: END,
+            update: { currentAgent: "orchestrator" as AgentType },
+          });
         }
       }
     }
   }
 
-  // Get frontend tools - orchestrator has most tools but NOT table-specific ones
+  // CHECK: If a sub-agent has active work in progress, route back to them
+  // This handles phase-based workflows where agents need to continue their work
+  // The agent is responsible for clearing awaitingUserAction when work is complete
+  if (state.awaitingUserAction) {
+    const workState = state.awaitingUserAction;
+    const awaitingAgent = workState.agent as AgentType;
+    console.log(`  [WORK STATE] Agent "${awaitingAgent}" has active work in progress`);
+    console.log(`  [WORK STATE] Phase: ${workState.phase}`);
+    console.log(`  [WORK STATE] Pending tool: ${workState.pendingTool || "none"}`);
+    console.log(`  [WORK STATE] Allowed tools: ${workState.allowedTools?.join(", ") || "none"}`);
+    console.log(`  [WORK STATE] Routing back to ${awaitingAgent} to continue work`);
+    return new Command({
+      goto: awaitingAgent,
+      update: { 
+        // DON'T clear awaitingUserAction - let the agent manage its own state
+        currentAgent: awaitingAgent,
+      },
+    });
+  }
+
+  // Get frontend tools - supervisor has most tools but NOT table-specific ones
   const frontendActions = state.copilotkit?.actions ?? [];
   
-  // Table tools that should be handled by the Data Agent, not orchestrator
-  // switchViewMode is kept for navigation, but table-specific operations go to data_agent
-  const tableToolsForDataAgent = new Set([
-    "switchTableViewMode",
-    "getTableViewState",
-    "getTableFilterOptions",
-    "addTableFilter",
-    "clearTableFilters",
-    "addTableSort",
-    "clearTableSorts",
-    "setTableGrouping",
-    "clearTableGrouping",
-    "getTableColumns",
-    "showTableColumn",
-    "hideTableColumn",
-    "exportTableData",
-    "listTableViews",
-    "saveTableView",
-    "loadTableView",
-    "deleteTableView",
-    "searchTable",
-    "getTableDataSummary",
-    "getFieldValueDistribution",
-  ]);
-  
-  // Orchestrator has access to frontend tools EXCEPT table-specific ones
+  // Supervisor has access to CopilotKit frontend tools EXCEPT table-specific ones
   // Table operations are routed to the Data Agent for specialized handling
-  const orchestratorTools = frontendActions.filter(
-    (action: { name: string }) => !tableToolsForDataAgent.has(action.name)
+  const frontendTools = frontendActions.filter(
+    (action: { name: string }) => !TABLE_TOOLS_FOR_DATA_AGENT.has(action.name)
   );
 
-  console.log("  Available tools:", orchestratorTools.map((t: { name: string }) => t.name).join(", ") || "none");
-  console.log("  Total frontend tools:", orchestratorTools.length);
+  console.log("  Available CopilotKit tools:", frontendTools.map((t: { name: string }) => t.name).join(", ") || "none");
+  console.log("  Total frontend tools:", frontendTools.length);
 
   // Build dynamic system prompt with context
   let systemContent = ORCHESTRATOR_SYSTEM_PROMPT;
@@ -569,12 +628,27 @@ Consider starting with the Strategist to gather requirements.`;
     systemContent += `\n\n### Research: Not yet conducted`;
   }
 
+  if (state.plannedStructure) {
+    const executed = Object.keys(state.plannedStructure.executedNodes || {}).length;
+    const total = state.plannedStructure.nodes.length;
+    const status = state.plannedStructure.executionStatus;
+    
+    systemContent += `\n\n### Course Plan (from Architect) ${status === 'completed' ? '✓' : '⏳'}
+- Status: ${status.toUpperCase()}
+- Progress: ${executed}/${total} nodes created
+- Plan saved at: ${state.plannedStructure.plannedAt}`;
+    
+    if (status === 'in_progress' || status === 'planned') {
+      systemContent += `\n- **Action needed**: Route to architect to continue building structure`;
+    }
+  }
+
   if (state.courseStructure) {
     systemContent += `\n\n### Course Structure (from Architect) ✓
 - Total Nodes: ${state.courseStructure.totalNodes}
 - Max Depth: ${state.courseStructure.maxDepth}
 - Summary: ${state.courseStructure.summary}`;
-  } else {
+  } else if (!state.plannedStructure) {
     systemContent += `\n\n### Course Structure: Not yet designed`;
   }
 
@@ -592,564 +666,314 @@ Consider starting with the Strategist to gather requirements.`;
 - Nodes Created: ${state.writtenContent.length}`;
   }
 
-  // Add routing instructions
+  // Add routing instructions for supervisor
   systemContent += `\n\n## Routing Instructions
 
-**IMPORTANT**: You must be EXPLICIT when routing to sub-agents vs asking the user questions.
+**Use the supervisor_response tool** to structure your response and route to sub-agents.
 
-### When asking the user a question (waiting for their input):
-- Simply ask your question
-- Do NOT mention routing or delegating
-- The system will wait for user input automatically
-- Example: "What topic would you like to create training content about?"
+### Available sub-agents:
+- **strategist** - For requirements gathering, project brief creation
+- **researcher** - For knowledge gathering, web search, document search
+- **architect** - For course structure design, hierarchy planning
+- **writer** - For content creation, node writing
+- **visual_designer** - For design and aesthetics
+- **project_agent** - For project listing, creation, navigation
+- **node_agent** - For node operations, template management, edit mode
+- **data_agent** - For table view operations, filtering, sorting, grouping
+- **document_agent** - For document search (RAG), document management
+- **media_agent** - For media library (Microverse) operations
+- **framework_agent** - For competency framework and criteria mapping
+- **complete** - When no routing is needed (asking user questions, waiting for input)
 
-### When delegating to a sub-agent (after you have enough info):
-- Use EXPLICIT routing phrases that make it clear you're delegating NOW
-- Include the marker [ROUTE:agent_name] in your response
-- Examples:
-  - "Now that I understand your needs, [ROUTE:strategist] I'm routing to the Strategist to gather detailed requirements."
-  - "[ROUTE:researcher] Let me have the Researcher look into this topic."
-  - "[ROUTE:architect] I'm delegating to the Architect to design the course structure."
+### When to route:
+- User explicitly requests a specialist
+- Task requires specialized tools the supervisor doesn't have
+- Complex operation that benefits from specialized context
 
-### Available route markers:
-- [ROUTE:strategist] - For requirements gathering
-- [ROUTE:researcher] - For knowledge gathering  
-- [ROUTE:architect] - For course structure design
-- [ROUTE:writer] - For content creation
-- [ROUTE:visual_designer] - For design and aesthetics
-- [ROUTE:data_agent] - For table view operations, filtering, sorting, grouping, data queries
-
-**Key rule**: If you're asking the user something, DON'T include a route marker. Only include [ROUTE:x] when you're ready to hand off work.`;
+### When NOT to route (use 'complete'):
+- Asking user a question
+- Performing actions with your own tools
+- User interaction and clarification`;
 
   // Create system message with prompt caching
-  // The static base prompt is cached (ephemeral cache for ~5 min) to reduce costs
-  // Dynamic context is appended without caching
   const systemMessage = new SystemMessage({
     content: [
       {
         type: "text",
         text: ORCHESTRATOR_SYSTEM_PROMPT,
-        // Cache the static system prompt for repeated calls
-        // This reduces costs by ~10x for the cached portion
         cache_control: { type: "ephemeral" },
       },
       {
         type: "text",
-        // Dynamic context that changes per invocation (not cached)
         text: systemContent.replace(ORCHESTRATOR_SYSTEM_PROMPT, ""),
       },
     ],
   });
 
-  // Bind tools and invoke
-  const modelWithTools = orchestratorTools.length > 0
-    ? orchestratorModel.bindTools(orchestratorTools)
-    : orchestratorModel;
+  // Bind SUPERVISOR_ROUTING_TOOL along with CopilotKit frontend tools
+  // The supervisor can call frontend tools directly OR route to sub-agents
+  const allTools = [...frontendTools, SUPERVISOR_ROUTING_TOOL];
+  const modelWithTools = orchestratorModel.bindTools(allTools);
 
-  // Prepare messages with full context management pipeline:
-  // 1. Summarize old messages if context is getting large
-  // 2. Trim to token/message limits
-  // 3. Filter orphaned tool results
-  const summarizedMessages = await summarizeIfNeeded(state.messages || [], {
-    triggerTokens: TOKEN_LIMITS.orchestrator,
-    keepMessages: 20,
-    logPrefix: "[orchestrator]",
-  });
-  const trimmedMessages = await trimMessages(summarizedMessages, {
+  // Prepare messages with unified context management pipeline
+  // Uses lower summarization threshold (30k) to prevent message bloat seen in logs (224+ messages)
+  const filteredMessages = await processContext(state.messages || [], {
+    maxTokens: TOKEN_LIMITS.orchestrator,
     fallbackMessageCount: MESSAGE_LIMITS.orchestrator,
-    logPrefix: "[orchestrator]",
+    enableSummarization: true,
+    summarizeTriggerTokens: 30000, // Lowered from 100k - was never triggering
+    summarizeKeepMessages: 15,
+    enableToolClearing: true, // Clear old tool results to save context
+    toolKeepCount: 5,
+    logPrefix: "[supervisor]",
   });
-  const filteredMessages = filterOrphanedToolResults(trimmedMessages, "[orchestrator]");
 
   const customConfig = copilotkitCustomizeConfig(config, {
     emitToolCalls: true,
   });
 
-  console.log("  Invoking orchestrator model...");
+  console.log("  Invoking supervisor model...");
 
   const response = await modelWithTools.invoke(
     [systemMessage, ...filteredMessages],
     customConfig
   );
 
-  console.log("  Orchestrator response received");
+  console.log("  Supervisor response received");
 
   const aiResponse = response as AIMessage;
-  if (aiResponse.tool_calls?.length) {
+  let updatedMessages = [...state.messages, response];
+
+  // Handle tool calls for routing
+  if (aiResponse.tool_calls && aiResponse.tool_calls.length > 0) {
     console.log("  Tool calls:", aiResponse.tool_calls.map((tc) => tc.name).join(", "));
+    
+    // Check if supervisor_response tool was called for routing
+    const routingToolCall = aiResponse.tool_calls.find(tc => tc.name === "supervisor_response");
+    
+    if (routingToolCall) {
+      const args = routingToolCall.args as { answer: string; next_agent?: string };
+      const nextAgent = args.next_agent;
+      
+      // Add tool response message
+      const toolResponse = new ToolMessage({
+        tool_call_id: routingToolCall.id!,
+        content: `Routing to ${nextAgent || 'complete'} and providing the answer`,
+      });
+      
+      // Add the answer as an AIMessage
+      const answerMessage = new AIMessage({ content: args.answer });
+      
+      updatedMessages = [...updatedMessages, toolResponse, answerMessage];
+      
+      // Route to sub-agent if specified and not 'complete'
+      if (nextAgent && nextAgent !== "complete") {
+        // State validation warnings for agents that expect prior work
+        if (nextAgent === "architect" && !state.projectBrief) {
+          console.warn("[supervisor] WARNING: Routing to architect but projectBrief is null. Consider running strategist first.");
+        }
+        if (nextAgent === "architect" && !state.researchFindings) {
+          console.warn("[supervisor] WARNING: Routing to architect but researchFindings is null. Consider running researcher first.");
+        }
+        if (nextAgent === "writer" && !state.courseStructure) {
+          console.warn("[supervisor] WARNING: Routing to writer but courseStructure is null. Consider running architect first.");
+        }
+        
+        console.log(`  -> Routing to sub-agent: ${nextAgent}`);
+        return new Command({
+          goto: nextAgent,
+          update: {
+            messages: updatedMessages,
+            currentAgent: nextAgent as AgentType,
+            agentHistory: [nextAgent as AgentType],
+          },
+        });
+      }
+      
+      // supervisor_response with 'complete' or no next_agent - return with answer
+      console.log("  -> Routing to END (supervisor response complete)");
+      return new Command({
+        goto: END,
+        update: {
+          messages: updatedMessages,
+          currentAgent: "orchestrator" as AgentType,
+        },
+      });
+    }
+    
+    // CopilotKit frontend tool call (not supervisor_response) - route to END for CopilotKit to execute
+    console.log("  -> Routing to END (CopilotKit tool execution)");
+    return new Command({
+      goto: END,
+      update: {
+        messages: updatedMessages,
+        currentAgent: "orchestrator" as AgentType,
+      },
+    });
   }
 
-  // Detect routing directives in response
-  const responseText = typeof aiResponse.content === "string"
-    ? aiResponse.content
-    : Array.isArray(aiResponse.content)
-    ? aiResponse.content
-        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-    : "";
-
-  const routingDecision = detectRoutingDirective(responseText);
-  if (routingDecision) {
-    console.log(`  Detected routing to: ${routingDecision.nextAgent}`);
-  }
-
-  // Check for pending async user actions (e.g., document upload)
-  // This prevents premature routing when the user is in the middle of uploading
-  const pendingUpload = detectPendingUpload([...filteredMessages, response]);
-  const awaitingUserAction = pendingUpload || null;
-  
-  if (awaitingUserAction) {
-    console.log(`  Setting awaitingUserAction: ${awaitingUserAction}`);
-  } else if (state.awaitingUserAction) {
-    console.log(`  Clearing awaitingUserAction (was: ${state.awaitingUserAction})`);
-  }
-
-  return {
-    messages: [response],
-    currentAgent: "orchestrator",
-    routingDecision: null,  // Never auto-route - wait for user to explicitly request
-    awaitingUserAction,
-  };
+  // No tool calls - end and wait for user input
+  console.log("  -> Routing to END (waiting for user input)");
+  return new Command({
+    goto: END,
+    update: {
+      messages: updatedMessages,
+      currentAgent: "orchestrator" as AgentType,
+    },
+  });
 }
 
 // ============================================================================
-// ROUTING DETECTION - Only detect EXPLICIT routing commands
+// SUBGRAPH CREATION - CopilotKit Supervisor Pattern
 // ============================================================================
+
+console.log("[supervisor] Creating sub-agent subgraphs...");
 
 /**
- * Detects explicit routing directives in text.
- * 
- * IMPORTANT: Only routes when the orchestrator explicitly indicates it's delegating NOW.
- * Does NOT route for:
- * - Questions to the user (waiting for input)
- * - Explanations of what agents can do
- * - Future/conditional statements ("I could ask the strategist...")
- * 
- * Only routes for:
- * - Explicit present-tense delegation: "I'm routing to", "Delegating to", "Handing off to"
- * - Active action statements: "I'll now have the strategist...", "Let me get the researcher..."
+ * Creates a subgraph wrapper for a sub-agent node function.
+ * Following CopilotKit multi-agent supervisor pattern:
+ * - Each sub-agent is a compiled StateGraph
+ * - Added as a node to the main workflow
+ * - Simple edge back to supervisor after completion
  */
-function detectRoutingDirective(text: string): { nextAgent: AgentType; reason: string; task: string } | null {
-  const lower = text.toLowerCase();
-  
-  // First, check if this is a question to the user - if so, DON'T route
-  const isQuestion = lower.includes("what would you like") ||
-    lower.includes("tell me about") ||
-    lower.includes("what are you working on") ||
-    lower.includes("could you tell me") ||
-    lower.includes("what do you need") ||
-    lower.includes("how can i help") ||
-    lower.includes("let me know") ||
-    lower.includes("?");
-  
-  if (isQuestion) {
-    // If it's a question, only route if there's ALSO an explicit "routing now" phrase
-    const hasExplicitRouting = 
-      lower.includes("i'm routing to") ||
-      lower.includes("delegating to") ||
-      lower.includes("handing off to") ||
-      lower.includes("transferring to");
-    
-    if (!hasExplicitRouting) {
-      return null; // It's a question without explicit routing - wait for user
-    }
-  }
-
-  // Look for EXPLICIT routing phrases (present tense, active delegation)
-  const explicitRoutingPhrases = [
-    /i(?:'m| am) (?:now )?(?:routing|delegating|handing off|transferring) to (?:the )?(\w+)/i,
-    /let me (?:now )?(?:get|have|ask) (?:the )?(\w+) (?:agent )?to/i,
-    /i(?:'ll| will) (?:now )?have (?:the )?(\w+) (?:agent )?(?:start|begin|handle|take over)/i,
-    /(?:routing|delegating|handing off) (?:this )?to (?:the )?(\w+)/i,
-    /\[ROUTE:(\w+)\]/i, // Explicit routing tag
-  ];
-
-  for (const pattern of explicitRoutingPhrases) {
-    const match = lower.match(pattern);
-    if (match) {
-      const agentName = match[1].toLowerCase();
-      
-      // Map to agent type
-      if (agentName.includes("strategist") || agentName === "strategist") {
-        return { nextAgent: "strategist", reason: "Explicit routing to strategist", task: text };
-      }
-      if (agentName.includes("researcher") || agentName === "researcher") {
-        return { nextAgent: "researcher", reason: "Explicit routing to researcher", task: text };
-      }
-      if (agentName.includes("architect") || agentName === "architect") {
-        return { nextAgent: "architect", reason: "Explicit routing to architect", task: text };
-      }
-      if (agentName.includes("writer") || agentName === "writer") {
-        return { nextAgent: "writer", reason: "Explicit routing to writer", task: text };
-      }
-      if (agentName.includes("visual") || agentName.includes("designer")) {
-        return { nextAgent: "visual_designer", reason: "Explicit routing to visual designer", task: text };
-      }
-      if (agentName.includes("data") || agentName === "data_agent") {
-        return { nextAgent: "data_agent", reason: "Explicit routing to data agent", task: text };
-      }
-    }
-  }
-
-  return null;
+function createSubAgentGraph(
+  nodeFunction: (state: OrchestratorState, config: RunnableConfig) => Promise<Partial<OrchestratorState>>
+) {
+  // Use type assertion for StateGraph builder pattern
+  // The node name doesn't matter since this is a single-node subgraph
+  return new StateGraph(OrchestratorStateAnnotation)
+    .addNode("agent" as any, nodeFunction)
+    .addEdge(START, "agent" as any)
+    .addEdge("agent" as any, END)
+    .compile();
 }
-
-// ============================================================================
-// ROUTING LOGIC
-// ============================================================================
-
-type NodeName = "orchestrator" | "strategist" | "researcher" | "architect" | "writer" | "visual_designer" | "data_agent" | "execute_backend_tools" | "__end__";
-
-function routeFromOrchestrator(state: OrchestratorState): NodeName {
-  console.log("\n[routing] From orchestrator...");
-
-  const messages = state.messages;
-  const lastMessage = messages[messages.length - 1] as AIMessage;
-
-  // Check if we're waiting for async user action (e.g., document upload)
-  // If so, don't route to sub-agents - wait for the user action to complete
-  if (state.awaitingUserAction) {
-    console.log(`  Awaiting user action: ${state.awaitingUserAction}`);
-    console.log("  -> Route to __end__ (waiting for user action)");
-    return "__end__";
-  }
-
-  // Check for tool calls
-  if (lastMessage.tool_calls?.length) {
-    const toolNames = lastMessage.tool_calls.map((tc) => tc.name);
-    console.log("  Tool calls detected:", toolNames.join(", "));
-
-    // Check if any are backend tools (researcher's tools)
-    const backendToolNames = new Set(researcherTools.map((t) => t.name));
-    const hasBackendTool = toolNames.some((name) => backendToolNames.has(name));
-
-    if (hasBackendTool) {
-      console.log("  -> Route to execute_backend_tools");
-      return "execute_backend_tools";
-    }
-
-    // Frontend tools route to END for CopilotKit execution
-    console.log("  -> Route to __end__ (frontend tools)");
-    return "__end__";
-  }
-
-  // USER-DRIVEN ROUTING: Check for routing based on user selections or orchestrator's explicit routing
-  
-  // First, check the orchestrator's response for explicit [ROUTE:x] markers
-  // This happens when orchestrator confirms routing after user selects an option
-  const responseText = typeof lastMessage.content === "string"
-    ? lastMessage.content
-    : Array.isArray(lastMessage.content)
-    ? lastMessage.content
-        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-    : "";
-  
-  // Check for [ROUTE:x] markers in orchestrator's response
-  const routeMatch = responseText.match(/\[ROUTE:(\w+)\]/i);
-  if (routeMatch) {
-    const agentName = routeMatch[1].toLowerCase();
-    console.log(`  Detected [ROUTE:${agentName}] marker in orchestrator response`);
-    
-    if (agentName === "strategist") {
-      console.log("  -> Route to strategist");
-      return "strategist";
-    }
-    if (agentName === "researcher") {
-      console.log("  -> Route to researcher");
-      return "researcher";
-    }
-    if (agentName === "architect") {
-      console.log("  -> Route to architect");
-      return "architect";
-    }
-    if (agentName === "writer") {
-      console.log("  -> Route to writer");
-      return "writer";
-    }
-    if (agentName === "visual_designer" || agentName === "visual") {
-      console.log("  -> Route to visual_designer");
-      return "visual_designer";
-    }
-    if (agentName === "data_agent" || agentName === "data") {
-      console.log("  -> Route to data_agent");
-      return "data_agent";
-    }
-  }
-
-  // Also check recent messages for user intent (HumanMessage or ToolMessage from offerOptions)
-  // Look at recent messages for routing keywords
-  const recentMessages = messages.slice(-5);
-  for (const msg of recentMessages) {
-    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
-    const isUserInput = msgType === "human" || msgType === "HumanMessage" || 
-                        msgType === "tool" || msgType === "ToolMessage";
-    
-    if (isUserInput) {
-      const msgContent = typeof msg.content === "string" ? msg.content.toLowerCase() : "";
-      
-      // Check for routing keywords from user selections or direct requests
-      if (msgContent.includes("research") || msgContent.includes("researcher")) {
-        console.log("  User requested research");
-        console.log("  -> Route to researcher");
-        return "researcher";
-      }
-      if (msgContent.includes("strategist") || msgContent.includes("requirements") || 
-          msgContent.includes("strategy") || msgContent.includes("define scope")) {
-        console.log("  User requested strategy");
-        console.log("  -> Route to strategist");
-        return "strategist";
-      }
-      if (msgContent.includes("architect") || msgContent.includes("structure") || 
-          msgContent.includes("build course")) {
-        console.log("  User requested architecture");
-        console.log("  -> Route to architect");
-        return "architect";
-      }
-      if (msgContent.includes("writer") || msgContent.includes("write content") || 
-          msgContent.includes("create content")) {
-        console.log("  User requested writing");
-        console.log("  -> Route to writer");
-        return "writer";
-      }
-      if (msgContent.includes("visual") || msgContent.includes("design") && msgContent.includes("aesthetics")) {
-        console.log("  User requested visual design");
-        console.log("  -> Route to visual_designer");
-        return "visual_designer";
-      }
-      if (msgContent.includes("table view") || msgContent.includes("data agent") || 
-          msgContent.includes("filter nodes") || msgContent.includes("data query")) {
-        console.log("  User requested data operations");
-        console.log("  -> Route to data_agent");
-        return "data_agent";
-      }
-    }
-  }
-
-  // Default: end and wait for user - orchestrator always asks before acting
-  console.log("  -> Route to __end__ (waiting for user direction)");
-  return "__end__";
-}
-
-// Maximum research iterations before forced routing to orchestrator
-const MAX_RESEARCH_ITERATIONS = 8;
-// Maximum total tool calls for researcher before forced stop
-const MAX_RESEARCH_TOOL_CALLS = 6;
 
 /**
- * Counts the number of research tool calls (web_search, searchDocuments, etc.) in messages.
+ * Creates a subgraph with tool execution capability.
+ * Used for agents that have backend tools (e.g., researcher with web_search).
+ * 
+ * The subgraph loops: agent -> tools -> agent until no more tool calls.
+ * This allows the agent to call tools multiple times before returning to supervisor.
  */
-function countResearchToolCalls(messages: BaseMessage[]): number {
-  const researchToolNames = new Set(["web_search", "searchDocuments", "searchDocumentsByText", "getDocumentLines", "getDocumentByName"]);
-  let count = 0;
-  for (const msg of messages) {
-    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
-    if (msgType === "tool" || msgType === "ToolMessage") {
-      const toolName = (msg as any).name || "";
-      if (researchToolNames.has(toolName)) count++;
-    }
-  }
-  return count;
-}
-
-function routeFromSubAgent(state: OrchestratorState): NodeName {
-  console.log("\n[routing] From sub-agent...");
-
-  const messages = state.messages;
-  const lastMessage = messages[messages.length - 1] as AIMessage;
-
-  // Check if we're waiting for async user action (e.g., document upload)
-  if (state.awaitingUserAction) {
-    console.log(`  Awaiting user action: ${state.awaitingUserAction}`);
-    console.log("  -> Route to __end__ (waiting for user action)");
-    return "__end__";
-  }
-
-  // SAFETY CHECK: If researcher has hit max iterations, force route to orchestrator
-  // Note: researchIterationCount is defined in state annotation but TS inference needs cast
-  const iterationCount = (state as any).researchIterationCount || 0;
-  if (state.currentAgent === "researcher" && iterationCount >= MAX_RESEARCH_ITERATIONS) {
-    console.log(`  SAFETY: Research max iterations (${MAX_RESEARCH_ITERATIONS}) reached`);
-    console.log("  -> Route to orchestrator (forced due to iteration limit)");
-    return "orchestrator";
-  }
-
-  // SAFETY CHECK: Count total research tool calls - hard limit to prevent runaway research
-  if (state.currentAgent === "researcher") {
-    const toolCallCount = countResearchToolCalls(messages);
-    console.log(`  Research tool calls so far: ${toolCallCount}/${MAX_RESEARCH_TOOL_CALLS}`);
-    if (toolCallCount >= MAX_RESEARCH_TOOL_CALLS) {
-      console.log(`  SAFETY: Research tool call limit (${MAX_RESEARCH_TOOL_CALLS}) reached`);
-      console.log("  -> Route to orchestrator (forced due to tool call limit)");
-      return "orchestrator";
-    }
-  }
-
-  // Check for tool calls
-  if (lastMessage.tool_calls?.length) {
-    const toolNames = lastMessage.tool_calls.map((tc) => tc.name);
-    console.log("  Tool calls detected:", toolNames.join(", "));
-
-    // Backend tools need execution
-    const backendToolNames = new Set(researcherTools.map((t) => t.name));
-    const hasBackendTool = toolNames.some((name) => backendToolNames.has(name));
-
-    if (hasBackendTool) {
-      console.log("  -> Route to execute_backend_tools");
-      return "execute_backend_tools";
-    }
-
-    // Check if uploadDocument is being called - will need to wait for async upload
-    const hasUploadDocument = toolNames.includes("uploadDocument");
-    if (hasUploadDocument) {
-      console.log("  uploadDocument called - will wait for user to upload");
-    }
-
-    // Frontend tools route to END for CopilotKit to handle
-    console.log("  -> Route to __end__ (frontend tools)");
-    return "__end__";
-  }
-
-  // No tool calls - check for explicit handoff marker
-  const responseText = typeof lastMessage.content === "string"
-    ? lastMessage.content
-    : Array.isArray(lastMessage.content)
-    ? lastMessage.content
-        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-    : "";
-
-  // ONLY route back to orchestrator if explicitly indicated with markers
-  const handingBack = responseText.toLowerCase().includes("[handoff:orchestrator]") ||
-    responseText.toLowerCase().includes("[done]");
-
-  if (handingBack) {
-    console.log("  -> Route to orchestrator (explicit handoff)");
-    return "orchestrator";
-  }
-
-  // DEFAULT: Route to __end__ and wait for user input
-  // This prevents loops when sub-agents return thinking-only or empty responses
-  // The next user message will trigger the graph to continue
-  console.log("  -> Route to __end__ (waiting for user input)");
-  return "__end__";
-}
-
-function routeAfterToolExecution(state: OrchestratorState): NodeName {
-  console.log("\n[routing] After tool execution...");
-
-  const currentAgent = state.currentAgent || "orchestrator";
-  const messages = state.messages;
+function createSubAgentGraphWithTools(
+  nodeFunction: (state: OrchestratorState, config: RunnableConfig) => Promise<Partial<OrchestratorState>>,
+  tools: StructuredToolInterface[]
+) {
+  const toolNode = new ToolNode(tools);
   
-  // SAFETY CHECK: If researcher has hit max iterations, force route to orchestrator
-  // This prevents infinite tool execution loops
-  // Note: researchIterationCount is defined in state annotation but TS inference needs cast
-  const iterationCount = (state as any).researchIterationCount || 0;
-  if (currentAgent === "researcher" && iterationCount >= MAX_RESEARCH_ITERATIONS) {
-    console.log(`  SAFETY: Research max iterations (${MAX_RESEARCH_ITERATIONS}) reached after tool execution`);
-    console.log("  -> Route to orchestrator (forced due to iteration limit)");
-    return "orchestrator";
-  }
-
-  // SAFETY CHECK: Count total research tool calls - hard limit
-  if (currentAgent === "researcher") {
-    const toolCallCount = countResearchToolCalls(messages);
-    console.log(`  Research tool calls after execution: ${toolCallCount}/${MAX_RESEARCH_TOOL_CALLS}`);
-    if (toolCallCount >= MAX_RESEARCH_TOOL_CALLS) {
-      console.log(`  SAFETY: Research tool call limit (${MAX_RESEARCH_TOOL_CALLS}) reached after tool execution`);
-      console.log("  -> Route to orchestrator (forced due to tool call limit)");
-      return "orchestrator";
+  // Route based on whether the last message has tool calls
+  function shouldContinueToTools(state: OrchestratorState): "tools" | typeof END {
+    const messages = state.messages || [];
+    if (messages.length === 0) return END;
+    
+    const lastMsg = messages[messages.length - 1];
+    const msgType = (lastMsg as any)._getType?.() || (lastMsg as any).constructor?.name || "";
+    
+    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
+      const aiMsg = lastMsg as AIMessage;
+      // Check if there are tool calls that match our backend tools
+      if (aiMsg.tool_calls?.length) {
+        const toolNames = new Set(tools.map(t => t.name));
+        const hasBackendToolCalls = aiMsg.tool_calls.some(tc => toolNames.has(tc.name));
+        if (hasBackendToolCalls) {
+          console.log(`  [subgraph] Routing to tools: ${aiMsg.tool_calls.map(tc => tc.name).join(", ")}`);
+          return "tools";
+        }
+      }
     }
+    return END;
   }
-
-  // Return to the current agent to process results
-  console.log(`  -> Route back to ${currentAgent}`);
-  return currentAgent as NodeName;
+  
+  return new StateGraph(OrchestratorStateAnnotation)
+    .addNode("agent" as any, nodeFunction)
+    .addNode("tools" as any, toolNode)
+    .addEdge(START, "agent" as any)
+    .addConditionalEdges("agent" as any, shouldContinueToTools)
+    .addEdge("tools" as any, "agent" as any)
+    .compile();
 }
 
+// Create subgraphs for each sub-agent
+// Creative workflow agents
+const strategistSubgraph = createSubAgentGraph(strategistNode);
+// Researcher has backend tools (web_search, document search) - use tool-enabled subgraph
+const researcherSubgraph = createSubAgentGraphWithTools(researcherNode, researcherTools);
+const architectSubgraph = createSubAgentGraph(architectNode);
+const writerSubgraph = createSubAgentGraph(writerNode);
+const visualDesignerSubgraph = createSubAgentGraph(visualDesignerNode);
+
+// Tool-specialized sub-agents
+const projectAgentSubgraph = createSubAgentGraph(projectAgentNode);
+const nodeAgentSubgraph = createSubAgentGraph(nodeAgentNode);
+const dataAgentSubgraph = createSubAgentGraph(dataAgentNode);
+const documentAgentSubgraph = createSubAgentGraph(documentAgentNode);
+const mediaAgentSubgraph = createSubAgentGraph(mediaAgentNode);
+const frameworkAgentSubgraph = createSubAgentGraph(frameworkAgentNode);
+
+console.log("[supervisor] Sub-agent subgraphs created successfully");
+
 // ============================================================================
-// TOOL EXECUTION NODE
+// GRAPH DEFINITION - Supervisor Pattern with Subgraphs
 // ============================================================================
 
-const backendToolNode = new ToolNode(researcherTools);
+console.log("[supervisor] Building main workflow graph...");
 
-// ============================================================================
-// GRAPH DEFINITION
-// ============================================================================
-
-console.log("[orchestrator] Building workflow graph...");
+// Define all possible routing destinations for the supervisor
+const SUPERVISOR_ROUTING_DESTINATIONS = [
+  // Creative workflow agents
+  "strategist",
+  "researcher",
+  "architect", 
+  "writer",
+  "visual_designer",
+  // Tool-specialized sub-agents
+  "project_agent",
+  "node_agent",
+  "data_agent",
+  "document_agent",
+  "media_agent",
+  "framework_agent",
+  // End (wait for user/CopilotKit)
+  END,
+];
 
 const workflow = new StateGraph(OrchestratorStateAnnotation)
-  // Add all nodes
-  .addNode("orchestrator", orchestratorNode)
-  .addNode("strategist", strategistNode)
-  .addNode("researcher", researcherNode)
-  .addNode("architect", architectNode)
-  .addNode("writer", writerNode)
-  .addNode("visual_designer", visualDesignerNode)
-  .addNode("data_agent", dataAgentNode)
-  .addNode("execute_backend_tools", backendToolNode)
+  // Supervisor node - uses Command for routing
+  .addNode("supervisor", supervisorNode, { 
+    ends: SUPERVISOR_ROUTING_DESTINATIONS 
+  })
+  
+  // Creative workflow subgraphs
+  .addNode("strategist", strategistSubgraph)
+  .addNode("researcher", researcherSubgraph)
+  .addNode("architect", architectSubgraph)
+  .addNode("writer", writerSubgraph)
+  .addNode("visual_designer", visualDesignerSubgraph)
+  
+  // Tool-specialized sub-agent subgraphs
+  .addNode("project_agent", projectAgentSubgraph)
+  .addNode("node_agent", nodeAgentSubgraph)
+  .addNode("data_agent", dataAgentSubgraph)
+  .addNode("document_agent", documentAgentSubgraph)
+  .addNode("media_agent", mediaAgentSubgraph)
+  .addNode("framework_agent", frameworkAgentSubgraph)
 
-  // Entry point
-  .addEdge(START, "orchestrator")
+  // Entry point -> supervisor
+  .addEdge(START, "supervisor")
 
-  // Orchestrator routing
-  .addConditionalEdges("orchestrator", routeFromOrchestrator, {
-    strategist: "strategist",
-    researcher: "researcher",
-    architect: "architect",
-    writer: "writer",
-    visual_designer: "visual_designer",
-    data_agent: "data_agent",
-    execute_backend_tools: "execute_backend_tools",
-    __end__: END,
-  })
-
-  // Sub-agent routing (all go back to orchestrator or to tools)
-  .addConditionalEdges("strategist", routeFromSubAgent, {
-    orchestrator: "orchestrator",
-    execute_backend_tools: "execute_backend_tools",
-    __end__: END,
-  })
-  .addConditionalEdges("researcher", routeFromSubAgent, {
-    orchestrator: "orchestrator",
-    execute_backend_tools: "execute_backend_tools",
-    __end__: END,
-  })
-  .addConditionalEdges("architect", routeFromSubAgent, {
-    orchestrator: "orchestrator",
-    execute_backend_tools: "execute_backend_tools",
-    __end__: END,
-  })
-  .addConditionalEdges("writer", routeFromSubAgent, {
-    orchestrator: "orchestrator",
-    execute_backend_tools: "execute_backend_tools",
-    __end__: END,
-  })
-  .addConditionalEdges("visual_designer", routeFromSubAgent, {
-    orchestrator: "orchestrator",
-    execute_backend_tools: "execute_backend_tools",
-    __end__: END,
-  })
-  .addConditionalEdges("data_agent", routeFromSubAgent, {
-    orchestrator: "orchestrator",
-    execute_backend_tools: "execute_backend_tools",
-    __end__: END,
-  })
-
-  // After tool execution, route back to current agent
-  .addConditionalEdges("execute_backend_tools", routeAfterToolExecution, {
-    orchestrator: "orchestrator",
-    strategist: "strategist",
-    researcher: "researcher",
-    architect: "architect",
-    writer: "writer",
-    visual_designer: "visual_designer",
-    data_agent: "data_agent",
-  });
+  // Simple edges: sub-agents route back to supervisor after completion
+  // Following CopilotKit supervisor pattern - no conditional edges needed
+  .addEdge("strategist", "supervisor")
+  .addEdge("researcher", "supervisor")
+  .addEdge("architect", "supervisor")
+  .addEdge("writer", "supervisor")
+  .addEdge("visual_designer", "supervisor")
+  .addEdge("project_agent", "supervisor")
+  .addEdge("node_agent", "supervisor")
+  .addEdge("data_agent", "supervisor")
+  .addEdge("document_agent", "supervisor")
+  .addEdge("media_agent", "supervisor")
+  .addEdge("framework_agent", "supervisor");
 
 // ============================================================================
 // PERSISTENCE SETUP
@@ -1163,14 +987,14 @@ const IS_LANGSMITH_CLOUD = !SUPABASE_DB_URL;
 let checkpointer: PostgresSaver | undefined;
 
 if (!IS_LANGSMITH_CLOUD && SUPABASE_DB_URL) {
-  console.log("[orchestrator] Initializing PostgreSQL checkpointer...");
-  console.log("[orchestrator] DB URL:", SUPABASE_DB_URL.replace(/:[^:@]+@/, ":****@"));
+  console.log("[supervisor] Initializing PostgreSQL checkpointer...");
+  console.log("[supervisor] DB URL:", SUPABASE_DB_URL.replace(/:[^:@]+@/, ":****@"));
   
   checkpointer = PostgresSaver.fromConnString(SUPABASE_DB_URL);
   await checkpointer.setup();
-  console.log("[orchestrator] PostgreSQL checkpointer initialized successfully");
+  console.log("[supervisor] PostgreSQL checkpointer initialized successfully");
 } else {
-  console.log("[orchestrator] Running in LangSmith Cloud - using managed checkpointer");
+  console.log("[supervisor] Running in LangSmith Cloud - using managed checkpointer");
 }
 
 // Compile the graph
@@ -1178,9 +1002,10 @@ export const agent = workflow.compile({
   ...(checkpointer && { checkpointer }),
 });
 
-// Note: recursion_limit is set via config when invoking the graph, not at compile time
-// The safety limit is enforced by the user-driven flow which always routes to __end__
+console.log("[supervisor] Workflow graph compiled successfully");
+console.log("[supervisor] Architecture: CopilotKit Supervisor Pattern with Subgraphs");
+console.log("[supervisor] Nodes: supervisor + 11 sub-agent subgraphs + backend_tools");
+console.log("[supervisor] Sub-agents: strategist, researcher, architect, writer, visual_designer,");
+console.log("[supervisor]            project_agent, node_agent, data_agent, document_agent, media_agent, framework_agent");
 
-console.log("[orchestrator] Workflow graph compiled successfully");
-console.log("[orchestrator] Nodes: orchestrator, strategist, researcher, architect, writer, visual_designer, data_agent, execute_backend_tools");
 

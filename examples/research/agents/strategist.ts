@@ -20,7 +20,8 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, ProjectBrief } from "../state/agent-state";
+import type { OrchestratorState, ProjectBrief, AgentWorkState, StrategistPhase } from "../state/agent-state";
+import { STRATEGIST_PHASES } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
@@ -172,9 +173,31 @@ After gathering information, structure your findings as a project brief that inc
 - Tools provide better UI with clickable options
 
 **When you've completed gathering requirements:**
-- Summarize the project brief in text
-- Include [DONE] at the end of your message to hand back to the orchestrator
-- Example: "Here's the project brief I've compiled... [DONE]"
+1. Output the project brief as a JSON code block with this EXACT format:
+   \`\`\`json
+   {
+     "purpose": "The primary goal of the training",
+     "objectives": ["Learning objective 1", "Learning objective 2"],
+     "inScope": ["Topic 1", "Topic 2"],
+     "outOfScope": ["Excluded topic 1"],
+     "constraints": ["Time limit", "Budget", "Technical requirements"],
+     "targetAudience": "Description of learners",
+     "industry": "Industry name"
+   }
+   \`\`\`
+2. Include [BRIEF COMPLETE] after the JSON block
+3. DO NOT call saveMemory - state handles this automatically. Your JSON output is parsed and stored in agent state, which is automatically passed to other agents.
+
+**Example completion:**
+"Based on our discussion, here's the project brief:
+\`\`\`json
+{
+  "purpose": "Train new employees on safety procedures",
+  "objectives": ["Identify hazards", "Apply PPE correctly"],
+  ...
+}
+\`\`\`
+[BRIEF COMPLETE]"
 
 Remember: Your output directly shapes everything that follows. A clear, well-defined project brief leads to better research, structure, and content.`;
 
@@ -193,29 +216,72 @@ export async function strategistNode(
   console.log("\n[strategist] ============ Strategist Agent ============");
   console.log("  Current project brief:", state.projectBrief ? "exists" : "none");
 
+  // Determine current phase from awaitingUserAction state
+  const workState = state.awaitingUserAction;
+  const currentPhase: StrategistPhase = (workState?.agent === "strategist" && workState?.phase) 
+    ? (workState.phase as StrategistPhase)
+    : "gathering_requirements";  // Default to first phase
+  
+  const phaseConfig = STRATEGIST_PHASES[currentPhase];
+  console.log(`  Current phase: ${currentPhase} - ${phaseConfig.description}`);
+  console.log(`  Allowed tools: ${phaseConfig.allowedTools.join(", ") || "none"}`);
+
   // Get frontend tools from CopilotKit state
-  // The strategist uses conversation tools + framework tools + minimal read tools for context
+  // PHASE-GATING: Only allow tools permitted in the current phase
   const frontendActions = state.copilotkit?.actions ?? [];
+  const allStrategistTools = [
+    // Conversation tools
+    "askClarifyingQuestions",
+    "offerOptions",
+    // Framework & Standards tools
+    "listFrameworks",
+    "getFrameworkDetails", 
+    "searchASQAUnits",
+    "listDocuments",
+    "importASQAUnit",
+    // Context tools (understand what exists)
+    "getProjectHierarchyInfo",
+    "listProjects",
+  ];
+  
+  // Filter to only tools allowed in current phase
   const strategistTools = frontendActions.filter((action: { name: string }) =>
-    [
-      // Conversation tools
-      "askClarifyingQuestions",
-      "offerOptions",
-      // Framework & Standards tools
-      "listFrameworks",
-      "getFrameworkDetails", 
-      "searchASQAUnits",
-      "listDocuments",
-      // Context tools (understand what exists)
-      "getProjectHierarchyInfo",
-      "listProjects",
-    ].includes(action.name)
+    allStrategistTools.includes(action.name) && phaseConfig.allowedTools.includes(action.name)
   );
 
-  console.log("  Available tools:", strategistTools.map((t: { name: string }) => t.name).join(", ") || "none");
+  console.log("  Available tools (phase-filtered):", strategistTools.map((t: { name: string }) => t.name).join(", ") || "none");
 
   // Build context-aware system message
   let systemContent = STRATEGIST_SYSTEM_PROMPT;
+  
+  // Add phase-specific instructions
+  systemContent += `\n\n## CURRENT PHASE: ${currentPhase.toUpperCase()}
+
+**You are in the "${currentPhase}" phase.** ${phaseConfig.description}
+
+ALLOWED TOOLS IN THIS PHASE: ${phaseConfig.allowedTools.join(", ") || "NONE - output your final brief"}
+
+${currentPhase === "gathering_requirements" ? `
+### Phase Instructions
+1. Use askClarifyingQuestions to gather ALL requirements FIRST
+2. DO NOT call searchASQAUnits or other search tools yet
+3. Wait for the user to answer ALL questions before proceeding
+4. When you have enough information, output: [PHASE: searching_references]
+` : ""}
+${currentPhase === "searching_references" ? `
+### Phase Instructions
+1. Now you can search for relevant ASQA units and frameworks
+2. Use searchASQAUnits to find relevant competency units
+3. Use listFrameworks/getFrameworkDetails if needed
+4. When searches are complete, output: [PHASE: creating_brief]
+` : ""}
+${currentPhase === "creating_brief" ? `
+### Phase Instructions
+1. NO TOOL CALLS - just output the final project brief
+2. Include all gathered requirements and any relevant ASQA units found
+3. Output the brief as a JSON code block
+4. End with [BRIEF COMPLETE]
+` : ""}`;
 
   // If we already have a partial brief, include it
   if (state.projectBrief) {
@@ -314,12 +380,110 @@ The user is waiting for your response.`,
     }
   }
 
+  // Extract response text for parsing
+  const responseText = typeof aiResponse.content === "string"
+    ? aiResponse.content
+    : Array.isArray(aiResponse.content)
+    ? aiResponse.content
+        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    : "";
+
+  // Check for phase transition markers
+  const phaseTransitionMatch = responseText.match(/\[PHASE:\s*(\w+)\]/i);
+  let nextPhase: StrategistPhase | null = null;
+  if (phaseTransitionMatch) {
+    const requestedPhase = phaseTransitionMatch[1].toLowerCase() as StrategistPhase;
+    if (requestedPhase in STRATEGIST_PHASES) {
+      nextPhase = requestedPhase;
+      console.log(`  [strategist] Phase transition detected: ${currentPhase} -> ${nextPhase}`);
+    }
+  }
+
+  // Check for brief completion markers
+  const isBriefComplete = responseText.toLowerCase().includes("[brief complete]") ||
+    responseText.toLowerCase().includes("[done]");
+  
+  // Parse project brief on completion
+  let parsedBrief: ProjectBrief | null = null;
+  if (isBriefComplete) {
+    console.log("  [strategist] Brief completion detected - parsing project brief");
+    parsedBrief = parseProjectBrief(responseText);
+    if (parsedBrief) {
+      console.log("  [strategist] Parsed project brief:", {
+        purpose: parsedBrief.purpose?.substring(0, 50) + "...",
+        objectivesCount: parsedBrief.objectives?.length || 0,
+        industry: parsedBrief.industry,
+      });
+    } else {
+      console.log("  [strategist] WARNING: Could not parse structured project brief from response");
+    }
+  }
+
+  // Check if response has HITL tool calls that require user interaction
+  const HITL_TOOLS = ["askClarifyingQuestions", "offerOptions"];
+  const hasHITLToolCall = aiResponse.tool_calls?.some(tc => 
+    HITL_TOOLS.includes(tc.name)
+  );
+  
+  // Check if any tool calls were made (HITL or otherwise)
+  const hasAnyToolCall = aiResponse.tool_calls && aiResponse.tool_calls.length > 0;
+  
+  // Determine the new work state
+  let newWorkState: AgentWorkState | null = null;
+  
+  if (isBriefComplete) {
+    // Work complete - clear the state
+    console.log("  [strategist] Work complete - clearing awaitingUserAction");
+    newWorkState = null;
+  } else if (nextPhase) {
+    // Phase transition - update to new phase
+    const newPhaseConfig = STRATEGIST_PHASES[nextPhase];
+    console.log(`  [strategist] Entering phase: ${nextPhase}`);
+    newWorkState = {
+      agent: "strategist",
+      phase: nextPhase,
+      allowedTools: [...newPhaseConfig.allowedTools],
+    };
+  } else if (hasHITLToolCall) {
+    // HITL tool call - stay in current phase, mark pending tool
+    const hitlTool = aiResponse.tool_calls?.find(tc => HITL_TOOLS.includes(tc.name));
+    console.log(`  [strategist] HITL tool call (${hitlTool?.name}) - awaiting user response`);
+    newWorkState = {
+      agent: "strategist",
+      phase: currentPhase,
+      pendingTool: hitlTool?.name,
+      allowedTools: [...phaseConfig.allowedTools],
+    };
+  } else if (hasAnyToolCall) {
+    // Non-HITL tool call - stay in current phase, continue working
+    console.log(`  [strategist] Tool calls made - continuing in phase ${currentPhase}`);
+    newWorkState = {
+      agent: "strategist",
+      phase: currentPhase,
+      allowedTools: [...phaseConfig.allowedTools],
+    };
+  } else {
+    // No tool calls, no phase transition - keep working
+    console.log(`  [strategist] No tool calls - continuing in phase ${currentPhase}`);
+    newWorkState = {
+      agent: "strategist",
+      phase: currentPhase,
+      allowedTools: [...phaseConfig.allowedTools],
+    };
+  }
+
   return {
     messages: [response],
     currentAgent: "strategist",
     agentHistory: ["strategist"],
     // Clear routing decision when this agent starts - prevents stale routing
     routingDecision: null,
+    // Include parsed project brief if available
+    ...(parsedBrief && { projectBrief: parsedBrief }),
+    // Update work state based on phase/HITL analysis
+    awaitingUserAction: newWorkState,
   };
 }
 

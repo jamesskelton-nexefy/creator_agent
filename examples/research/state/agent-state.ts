@@ -85,6 +85,30 @@ export interface ResearchBrief {
 }
 
 /**
+ * Planned structure from the Architect agent (PRE-creation phase).
+ * This is the plan BEFORE nodes are created, allowing resumption if interrupted.
+ * Separate from CourseStructure which represents the FINAL created structure.
+ */
+export interface PlannedStructure {
+  /** Overall structure summary */
+  summary: string;
+  /** Planned nodes in hierarchical order */
+  nodes: PlannedNode[];
+  /** Estimated total content pieces */
+  totalNodes: number;
+  /** Hierarchy depth (number of levels used) */
+  maxDepth: number;
+  /** Rationale for the structure */
+  rationale: string;
+  /** Planning timestamp */
+  plannedAt: string;
+  /** Status of plan execution */
+  executionStatus: "planned" | "in_progress" | "completed" | "failed";
+  /** Nodes that have been created (maps tempId to actual nodeId) */
+  executedNodes: Record<string, string>;
+}
+
+/**
  * Course structure from the Architect agent.
  * Detailed hierarchy of planned nodes.
  */
@@ -192,15 +216,26 @@ export interface CreatedNode {
 
 /**
  * Identifies which agent should be invoked next.
+ * 
+ * Agents are divided into:
+ * - Creative workflow: strategist, researcher, architect, writer, visual_designer
+ * - Tool-specialized: project_agent, node_agent, data_agent, document_agent, media_agent, framework_agent
  */
 export type AgentType = 
   | "orchestrator"
+  // Creative workflow agents
   | "strategist" 
   | "researcher" 
   | "architect" 
   | "writer" 
   | "visual_designer"
-  | "data_agent";
+  // Tool-specialized sub-agents
+  | "project_agent"
+  | "node_agent"
+  | "data_agent"
+  | "document_agent"
+  | "media_agent"
+  | "framework_agent";
 
 /**
  * Routing decision made by the orchestrator.
@@ -213,6 +248,160 @@ export interface RoutingDecision {
   /** Specific task/instructions for the agent */
   task: string;
 }
+
+// ============================================================================
+// AGENT WORK STATE - Phase-based workflow control
+// ============================================================================
+
+/**
+ * Tracks an agent's current work state including phase and allowed tools.
+ * This enables phase-gated workflows where agents must complete one phase
+ * before moving to the next (e.g., gather requirements → search → create brief).
+ */
+export interface AgentWorkState {
+  /** Which agent is doing work */
+  agent: AgentType;
+  /** Current phase of the agent's workflow */
+  phase: string;
+  /** Tool that triggered the wait (if HITL) */
+  pendingTool?: string;
+  /** Tools the agent is allowed to use in this phase */
+  allowedTools?: string[];
+  /** Additional metadata for the phase */
+  metadata?: {
+    questionsCount?: number;
+    searchesCompleted?: number;
+    optionsPresented?: number;
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Phase definitions for the Strategist agent.
+ * Controls workflow: gather requirements → search references → create brief
+ */
+export const STRATEGIST_PHASES = {
+  gathering_requirements: {
+    description: "Asking clarifying questions to understand the project",
+    allowedTools: ["askClarifyingQuestions", "offerOptions", "listDocuments"],
+    nextPhase: "searching_references",
+  },
+  searching_references: {
+    description: "Searching for relevant frameworks, units, and standards",
+    allowedTools: ["searchASQAUnits", "listFrameworks", "getFrameworkDetails", "importASQAUnit"],
+    nextPhase: "creating_brief",
+  },
+  creating_brief: {
+    description: "Creating the final project brief - no tool calls allowed",
+    allowedTools: [],
+    nextPhase: "complete",
+  },
+  complete: {
+    description: "Work complete",
+    allowedTools: [],
+    nextPhase: null,
+  },
+} as const;
+
+/**
+ * Phase definitions for the Visual Designer agent.
+ * Controls workflow: gather preferences → present options → finalize design
+ */
+export const VISUAL_DESIGNER_PHASES = {
+  gathering_preferences: {
+    description: "Understanding design preferences and requirements",
+    allowedTools: ["offerOptions", "askClarifyingQuestions", "searchMicroverse"],
+    nextPhase: "presenting_options",
+  },
+  presenting_options: {
+    description: "Presenting design theme options to the user",
+    allowedTools: ["offerOptions", "searchMicroverse", "getMicroverseDetails"],
+    nextPhase: "finalizing",
+  },
+  finalizing: {
+    description: "Finalizing the design specification - no tool calls allowed",
+    allowedTools: [],
+    nextPhase: "complete",
+  },
+  complete: {
+    description: "Work complete",
+    allowedTools: [],
+    nextPhase: null,
+  },
+} as const;
+
+/**
+ * Phase definitions for the Researcher agent.
+ * Controls workflow: research → synthesize findings
+ */
+export const RESEARCHER_PHASES = {
+  researching: {
+    description: "Gathering information from web and documents",
+    allowedTools: ["web_search", "listDocuments", "searchDocuments", "searchDocumentsByText", "getDocumentLines", "getDocumentByName", "searchMicroverse"],
+    nextPhase: "synthesizing",
+  },
+  synthesizing: {
+    description: "Synthesizing research findings - no tool calls allowed",
+    allowedTools: [],
+    nextPhase: "complete",
+  },
+  complete: {
+    description: "Work complete",
+    allowedTools: [],
+    nextPhase: null,
+  },
+} as const;
+
+/**
+ * Phase definitions for the Architect agent.
+ * Controls workflow: analyze structure → design course
+ */
+export const ARCHITECT_PHASES = {
+  analyzing: {
+    description: "Analyzing project structure and requirements",
+    allowedTools: ["getProjectHierarchyInfo", "getNodesByLevel", "getNodeChildren", "getNodeDetails", "getAvailableTemplates", "listAllNodeTemplates"],
+    nextPhase: "designing",
+  },
+  designing: {
+    description: "Designing and creating the course structure",
+    allowedTools: ["requestEditMode", "releaseEditMode", "createNode", "getAvailableTemplates", "getNodeTemplateFields", "offerOptions", "requestPlanApproval"],
+    nextPhase: "complete",
+  },
+  complete: {
+    description: "Work complete",
+    allowedTools: [],
+    nextPhase: null,
+  },
+} as const;
+
+/**
+ * Phase definitions for the Writer agent.
+ * Controls workflow: plan content → write content
+ */
+export const WRITER_PHASES = {
+  planning: {
+    description: "Planning content structure and gathering context",
+    allowedTools: ["getNodesByLevel", "getNodeDetails", "getNodeChildren", "getAvailableTemplates", "searchDocuments", "searchMicroverse"],
+    nextPhase: "writing",
+  },
+  writing: {
+    description: "Writing and creating content nodes",
+    allowedTools: ["requestEditMode", "releaseEditMode", "createNode", "updateNodeFields", "getNodeTemplateFields", "attachMicroverseToNode"],
+    nextPhase: "complete",
+  },
+  complete: {
+    description: "Work complete",
+    allowedTools: [],
+    nextPhase: null,
+  },
+} as const;
+
+/** Type for phase keys */
+export type StrategistPhase = keyof typeof STRATEGIST_PHASES;
+export type VisualDesignerPhase = keyof typeof VISUAL_DESIGNER_PHASES;
+export type ResearcherPhase = keyof typeof RESEARCHER_PHASES;
+export type ArchitectPhase = keyof typeof ARCHITECT_PHASES;
+export type WriterPhase = keyof typeof WRITER_PHASES;
 
 // ============================================================================
 // STATE ANNOTATION - Shared state for all agents
@@ -240,7 +429,21 @@ export const OrchestratorStateAnnotation = Annotation.Root({
     default: () => null,
   }),
 
-  /** Course structure from the Architect */
+  /** Planned structure from the Architect (PRE-creation phase) */
+  plannedStructure: Annotation<PlannedStructure | null>({
+    reducer: (existing, update) => {
+      if (!update) return existing;
+      if (!existing) return update;
+      // Merge executedNodes from both
+      return {
+        ...update,
+        executedNodes: { ...existing.executedNodes, ...update.executedNodes },
+      };
+    },
+    default: () => null,
+  }),
+
+  /** Course structure from the Architect (FINAL created structure) */
   courseStructure: Annotation<CourseStructure | null>({
     reducer: (existing, update) => update ?? existing,
     default: () => null,
@@ -292,11 +495,14 @@ export const OrchestratorStateAnnotation = Annotation.Root({
   }),
 
   /** 
-   * Tracks when the agent is waiting for async user action (e.g., file upload).
-   * Prevents premature graph re-entry during async operations.
-   * Set to a string describing the action (e.g., "document_upload"), cleared with null.
+   * Tracks an agent's current work state including phase and allowed tools.
+   * Enables phase-gated workflows where agents must complete one phase
+   * before moving to the next (e.g., gather requirements → search → create brief).
+   * 
+   * When set, the supervisor will route back to this agent until work is complete.
+   * Agents should update the phase as they progress through their workflow.
    */
-  awaitingUserAction: Annotation<string | null>({
+  awaitingUserAction: Annotation<AgentWorkState | null>({
     reducer: (existing, update) => update === undefined ? existing : update,
     default: () => null,
   }),

@@ -296,6 +296,88 @@ export function filterOrphanedToolResults(
 }
 
 // ============================================================================
+// REPAIR DANGLING TOOL CALLS (Deep Agents Pattern)
+// ============================================================================
+
+/**
+ * Repairs message history when tool calls have no corresponding results.
+ * Based on LangGraph Deep Agents "Dangling Tool Call Repair" pattern.
+ *
+ * The problem:
+ * - Agent requests tool call via AIMessage with tool_calls
+ * - Tool call is interrupted (user cancels, error, trimming, etc.)
+ * - AIMessage has tool_use but no corresponding ToolMessage result
+ * - This creates an invalid message sequence for Claude/Anthropic
+ *
+ * The solution:
+ * - Detects AIMessages with tool_calls that have no results
+ * - Creates synthetic ToolMessage responses indicating the call was cancelled
+ * - Repairs the message history before agent execution
+ *
+ * @param messages - Array of messages to repair
+ * @param logPrefix - Optional prefix for log messages
+ * @returns Repaired array of messages with synthetic tool results
+ */
+export function repairDanglingToolCalls(
+  messages: BaseMessage[],
+  logPrefix: string = ""
+): BaseMessage[] {
+  const prefix = logPrefix ? `${logPrefix} ` : "";
+
+  // First pass: collect all tool_result IDs in the message history
+  const toolResultIds = new Set<string>();
+  for (const msg of messages) {
+    const msgType = getMessageType(msg);
+    if (msgType === "tool" || msgType === "ToolMessage") {
+      toolResultIds.add((msg as ToolMessage).tool_call_id);
+    }
+  }
+
+  // Second pass: find AIMessages with unresolved tool_calls and insert synthetic results
+  const repaired: BaseMessage[] = [];
+  let repairedCount = 0;
+
+  for (const msg of messages) {
+    repaired.push(msg);
+
+    const msgType = getMessageType(msg);
+    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
+      const aiMsg = msg as AIMessage;
+
+      if (aiMsg.tool_calls?.length) {
+        // Find tool_calls without corresponding results
+        const danglingToolCalls = aiMsg.tool_calls.filter(
+          (tc) => tc.id && !toolResultIds.has(tc.id)
+        );
+
+        // Create synthetic ToolMessage for each dangling call
+        for (const toolCall of danglingToolCalls) {
+          if (!toolCall.id) continue;
+
+          const syntheticResult = new ToolMessage({
+            content: `[Tool call cancelled or interrupted - no result available]`,
+            tool_call_id: toolCall.id,
+            name: toolCall.name,
+          });
+
+          repaired.push(syntheticResult);
+          toolResultIds.add(toolCall.id); // Mark as resolved
+          repairedCount++;
+        }
+      }
+    }
+  }
+
+  if (repairedCount > 0) {
+    console.log(
+      `  ${prefix}[REPAIR] Created ${repairedCount} synthetic tool results for dangling tool calls`
+    );
+  }
+
+  return repaired;
+}
+
+// ============================================================================
 // TRIM MESSAGES (LangChain Integration)
 // ============================================================================
 
@@ -769,10 +851,20 @@ export interface ProcessContextOptions {
 
 /**
  * Processes context by applying multiple strategies in sequence:
- * 1. Filter orphaned tool results
- * 2. Clear old tool results (if enabled)
- * 3. Summarize (if enabled)
- * 4. Trim to token/message limit
+ * 1. Filter orphaned tool results (pre-trim cleanup)
+ * 2. Repair dangling tool calls (create synthetic results for interrupted calls)
+ * 3. Clear old tool results (if enabled)
+ * 4. Summarize (if enabled)
+ * 5. Trim to token/message limit
+ * 6. Filter orphaned tool results again (post-trim cleanup)
+ * 7. Repair dangling tool calls again (post-trim)
+ *
+ * Steps 6-7 are critical: trimMessages() fallback can create new orphans/danglers
+ * when no valid start point is found and it falls back to keeping last N messages.
+ *
+ * This follows LangGraph's "Deep Agents Harness" patterns:
+ * - Dangling tool call repair (AIMessage with tool_calls but no ToolMessage results)
+ * - Orphan tool result filtering (ToolMessage without matching AIMessage tool_use)
  *
  * @param messages - Messages to process
  * @param options - Processing options
@@ -797,10 +889,16 @@ export async function processContext(
 
   let processed = messages;
 
-  // Step 1: Filter orphaned tool results
+  // Step 1: Filter orphaned tool results (pre-trim)
+  // Removes ToolMessages that have no matching AIMessage with tool_use
   processed = filterOrphanedToolResults(processed, logPrefix);
 
-  // Step 2: Clear old tool results (if enabled)
+  // Step 2: Repair dangling tool calls (pre-trim)
+  // Creates synthetic ToolMessages for AIMessages with unresolved tool_calls
+  // This follows LangGraph Deep Agents "Dangling Tool Call Repair" pattern
+  processed = repairDanglingToolCalls(processed, logPrefix);
+
+  // Step 3: Clear old tool results (if enabled)
   if (enableToolClearing) {
     processed = clearOldToolResults(processed, {
       keepCount: toolKeepCount,
@@ -809,7 +907,7 @@ export async function processContext(
     });
   }
 
-  // Step 3: Summarize (if enabled)
+  // Step 4: Summarize (if enabled)
   if (enableSummarization) {
     processed = await summarizeIfNeeded(processed, {
       triggerTokens: summarizeTriggerTokens,
@@ -818,13 +916,23 @@ export async function processContext(
     });
   }
 
-  // Step 4: Trim to limit
+  // Step 5: Trim to limit
   processed = await trimMessages(processed, {
     maxTokens,
     model,
     fallbackMessageCount,
     logPrefix,
   });
+
+  // Step 6: Filter orphaned tool results AGAIN (post-trim)
+  // This catches orphans created by trimMessages() fallback logic
+  // when it keeps last N messages without respecting tool_use/tool_result pairs
+  processed = filterOrphanedToolResults(processed, logPrefix);
+
+  // Step 7: Repair dangling tool calls AGAIN (post-trim)
+  // This catches danglers created when trimming removes ToolMessages
+  // but keeps their corresponding AIMessage with tool_calls
+  processed = repairDanglingToolCalls(processed, logPrefix);
 
   return processed;
 }

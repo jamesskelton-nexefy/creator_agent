@@ -15,6 +15,7 @@ export {
   stripThinkingBlocks,
   // Core functions
   filterOrphanedToolResults,
+  repairDanglingToolCalls,
   trimMessages,
   summarizeIfNeeded,
   clearOldToolResults,
@@ -25,4 +26,5 @@ export {
   type ClearToolResultsOptions,
   type ProcessContextOptions,
 } from "./context-management";
+
 

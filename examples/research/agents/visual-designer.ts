@@ -18,8 +18,8 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, VisualDesign } from "../state/agent-state";
-import { getCondensedBrief } from "../state/agent-state";
+import type { OrchestratorState, VisualDesign, AgentWorkState, VisualDesignerPhase } from "../state/agent-state";
+import { getCondensedBrief, VISUAL_DESIGNER_PHASES } from "../state/agent-state";
 import { researcherTools } from "./researcher";
 
 // Centralized context management utilities
@@ -293,27 +293,66 @@ export async function visualDesignerNode(
   console.log("  Project brief available:", state.projectBrief ? "yes" : "no");
   console.log("  Existing design:", state.visualDesign ? "yes" : "no");
 
+  // Determine current phase from awaitingUserAction state
+  const workState = state.awaitingUserAction;
+  const currentPhase: VisualDesignerPhase = (workState?.agent === "visual_designer" && workState?.phase) 
+    ? (workState.phase as VisualDesignerPhase)
+    : "gathering_preferences";  // Default to first phase
+  
+  const phaseConfig = VISUAL_DESIGNER_PHASES[currentPhase];
+  console.log(`  Current phase: ${currentPhase} - ${phaseConfig.description}`);
+  console.log(`  Allowed tools: ${phaseConfig.allowedTools.join(", ") || "none"}`);
+
   // Get frontend tools from CopilotKit state
+  // PHASE-GATING: Only allow tools permitted in the current phase
   const frontendActions = state.copilotkit?.actions ?? [];
+  const allDesignerToolNames = [
+    "offerOptions",
+    "askClarifyingQuestions",
+    "searchMicroverse",
+    "getMicroverseDetails",
+  ];
+  
+  // Filter to only tools allowed in current phase
   const frontendDesignerTools = frontendActions.filter((action: { name: string }) =>
-    [
-      // User interaction
-      "offerOptions",
-      // Media/asset search
-      "searchMicroverse",
-      "getMicroverseDetails",
-    ].includes(action.name)
+    allDesignerToolNames.includes(action.name) && phaseConfig.allowedTools.includes(action.name)
   );
 
-  // Combine frontend tools with backend web_search tool
-  const designerTools = webSearchTool
+  // Combine frontend tools with backend web_search tool (if in appropriate phase)
+  const designerTools = webSearchTool && phaseConfig.allowedTools.includes("web_search")
     ? [...frontendDesignerTools, webSearchTool]
     : frontendDesignerTools;
 
-  console.log("  Available tools:", designerTools.map((t: { name: string }) => t.name).join(", ") || "none");
+  console.log("  Available tools (phase-filtered):", designerTools.map((t: { name: string }) => t.name).join(", ") || "none");
 
   // Build context-aware system message
   let systemContent = DESIGNER_SYSTEM_PROMPT;
+  
+  // Add phase-specific instructions
+  systemContent += `\n\n## CURRENT PHASE: ${currentPhase.toUpperCase()}
+
+**You are in the "${currentPhase}" phase.** ${phaseConfig.description}
+
+ALLOWED TOOLS IN THIS PHASE: ${phaseConfig.allowedTools.join(", ") || "NONE - output your final design spec"}
+
+${currentPhase === "gathering_preferences" ? `
+### Phase Instructions
+1. Use offerOptions to understand the user's design preferences
+2. You may search Microverse for existing brand assets
+3. When you understand preferences, output: [PHASE: presenting_options]
+` : ""}
+${currentPhase === "presenting_options" ? `
+### Phase Instructions
+1. Present 2-3 design theme options using offerOptions
+2. You may search for reference assets in Microverse
+3. When user selects an option, output: [PHASE: finalizing]
+` : ""}
+${currentPhase === "finalizing" ? `
+### Phase Instructions
+1. NO TOOL CALLS - just output the final design specification
+2. Output the design as a JSON code block
+3. End with [DESIGN COMPLETE]
+` : ""}`;
 
   // Include project brief
   if (state.projectBrief) {
@@ -412,12 +451,111 @@ The user is waiting for design options.`,
     }
   }
 
+  // Extract response text for parsing
+  const responseText = typeof aiResponse.content === "string"
+    ? aiResponse.content
+    : Array.isArray(aiResponse.content)
+    ? aiResponse.content
+        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    : "";
+
+  // Check for design completion markers
+  const isDesignComplete = responseText.toLowerCase().includes("[design complete]") ||
+    responseText.toLowerCase().includes("[done]") ||
+    responseText.toLowerCase().includes("visual design:");
+  
+  // Parse visual design on completion
+  let parsedDesign: VisualDesign | null = null;
+  if (isDesignComplete) {
+    console.log("  [visual_designer] Design completion detected - parsing visual design");
+    parsedDesign = parseVisualDesign(responseText);
+    if (parsedDesign) {
+      console.log("  [visual_designer] Parsed visual design:", {
+        theme: parsedDesign.theme,
+        tone: parsedDesign.writingTone.tone,
+        style: parsedDesign.typography.style,
+      });
+    } else {
+      console.log("  [visual_designer] WARNING: Could not parse structured visual design from response");
+    }
+  }
+
+  // Check for phase transition markers
+  const phaseTransitionMatch = responseText.match(/\[PHASE:\s*(\w+)\]/i);
+  let nextPhase: VisualDesignerPhase | null = null;
+  if (phaseTransitionMatch) {
+    const requestedPhase = phaseTransitionMatch[1].toLowerCase() as VisualDesignerPhase;
+    if (requestedPhase in VISUAL_DESIGNER_PHASES) {
+      nextPhase = requestedPhase;
+      console.log(`  [visual_designer] Phase transition detected: ${currentPhase} -> ${nextPhase}`);
+    }
+  }
+
+  // Check if response has HITL tool calls that require user interaction
+  const HITL_TOOLS = ["offerOptions", "askClarifyingQuestions"];
+  const hasHITLToolCall = aiResponse.tool_calls?.some(tc => 
+    HITL_TOOLS.includes(tc.name)
+  );
+  
+  // Check if any tool calls were made (HITL or otherwise)
+  const hasAnyToolCall = aiResponse.tool_calls && aiResponse.tool_calls.length > 0;
+  
+  // Determine the new work state
+  let newWorkState: AgentWorkState | null = null;
+  
+  if (isDesignComplete) {
+    // Work complete - clear the state
+    console.log("  [visual_designer] Work complete - clearing awaitingUserAction");
+    newWorkState = null;
+  } else if (nextPhase) {
+    // Phase transition - update to new phase
+    const newPhaseConfig = VISUAL_DESIGNER_PHASES[nextPhase];
+    console.log(`  [visual_designer] Entering phase: ${nextPhase}`);
+    newWorkState = {
+      agent: "visual_designer",
+      phase: nextPhase,
+      allowedTools: [...newPhaseConfig.allowedTools],
+    };
+  } else if (hasHITLToolCall) {
+    // HITL tool call - stay in current phase, mark pending tool
+    const hitlTool = aiResponse.tool_calls?.find(tc => HITL_TOOLS.includes(tc.name));
+    console.log(`  [visual_designer] HITL tool call (${hitlTool?.name}) - awaiting user response`);
+    newWorkState = {
+      agent: "visual_designer",
+      phase: currentPhase,
+      pendingTool: hitlTool?.name,
+      allowedTools: [...phaseConfig.allowedTools],
+    };
+  } else if (hasAnyToolCall) {
+    // Non-HITL tool call - stay in current phase, continue working
+    console.log(`  [visual_designer] Tool calls made - continuing in phase ${currentPhase}`);
+    newWorkState = {
+      agent: "visual_designer",
+      phase: currentPhase,
+      allowedTools: [...phaseConfig.allowedTools],
+    };
+  } else {
+    // No tool calls, no phase transition - keep working
+    console.log(`  [visual_designer] No tool calls - continuing in phase ${currentPhase}`);
+    newWorkState = {
+      agent: "visual_designer",
+      phase: currentPhase,
+      allowedTools: [...phaseConfig.allowedTools],
+    };
+  }
+
   return {
     messages: [response],
     currentAgent: "visual_designer",
     agentHistory: ["visual_designer"],
     // Clear routing decision when this agent starts - prevents stale routing
     routingDecision: null,
+    // Include parsed visual design if available
+    ...(parsedDesign && { visualDesign: parsedDesign }),
+    // Update work state based on phase/HITL analysis
+    awaitingUserAction: newWorkState,
   };
 }
 

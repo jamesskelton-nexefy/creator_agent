@@ -309,8 +309,184 @@ console.log('    DELETE /api/documents/:id');
 console.log('    POST /api/documents/search');
 
 // ============================================================================
+// MEMORY API ENDPOINTS
+// ============================================================================
+
+/**
+ * POST /api/memory/save
+ * Save a memory to the store
+ */
+app.post('/api/memory/save', async (req, res) => {
+  try {
+    const { content, category, userId = 'default' } = req.body;
+    
+    if (!content) {
+      res.status(400).json({ success: false, error: 'content is required' });
+      return;
+    }
+    
+    const memories = getUserMemories(userId);
+    const memory: Memory = {
+      id: `memory_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+      content,
+      category: category || 'general',
+      timestamp: new Date().toISOString(),
+      userId,
+    };
+    
+    memories.push(memory);
+    console.log(`[Memory API] Saved for user ${userId}: ${content.substring(0, 50)}...`);
+    
+    res.json({
+      success: true,
+      message: `Memory saved successfully. ID: ${memory.id}, Category: ${memory.category}`,
+      memory,
+    });
+  } catch (error) {
+    console.error('[Memory API] Save error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * POST /api/memory/recall
+ * Search memories by similarity
+ */
+app.post('/api/memory/recall', async (req, res) => {
+  try {
+    const { query, limit = 5, userId = 'default' } = req.body;
+    
+    if (!query) {
+      res.status(400).json({ success: false, error: 'query is required' });
+      return;
+    }
+    
+    const memories = getUserMemories(userId);
+    
+    if (memories.length === 0) {
+      res.json({ success: true, message: 'No memories found.', memories: [] });
+      return;
+    }
+    
+    // Sort by similarity to query
+    const scored = memories.map(m => ({
+      memory: m,
+      score: calculateSimilarity(query, m.content),
+    }));
+    
+    scored.sort((a, b) => b.score - a.score);
+    const topMemories = scored.slice(0, limit).filter(m => m.score > 0);
+    
+    console.log(`[Memory API] Recalled ${topMemories.length} memories for query: ${query}`);
+    
+    if (topMemories.length === 0) {
+      res.json({ success: true, message: 'No relevant memories found.', memories: [] });
+      return;
+    }
+    
+    const formattedMemories = topMemories
+      .map((m, i) => `${i + 1}. [${m.memory.category}] ${m.memory.content} (saved: ${m.memory.timestamp})`)
+      .join('\n');
+    
+    res.json({
+      success: true,
+      message: `Found ${topMemories.length} relevant memories:\n${formattedMemories}`,
+      memories: topMemories.map(m => m.memory),
+    });
+  } catch (error) {
+    console.error('[Memory API] Recall error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * POST /api/memory/list
+ * List all memories, optionally filtered by category
+ */
+app.post('/api/memory/list', async (req, res) => {
+  try {
+    const { category, limit = 10, userId = 'default' } = req.body;
+    
+    let memories = getUserMemories(userId);
+    
+    if (category) {
+      memories = memories.filter(m => m.category === category);
+    }
+    
+    const limitedMemories = memories.slice(-limit); // Get most recent
+    
+    console.log(`[Memory API] Listed ${limitedMemories.length} memories${category ? ` in category: ${category}` : ''}`);
+    
+    if (limitedMemories.length === 0) {
+      const message = category ? `No memories found in category: ${category}` : 'No memories found.';
+      res.json({ success: true, message, memories: [] });
+      return;
+    }
+    
+    const formattedMemories = limitedMemories
+      .map((m, i) => `${i + 1}. [${m.category}] ${m.content}`)
+      .join('\n');
+    
+    res.json({
+      success: true,
+      message: `Found ${limitedMemories.length} memories:\n${formattedMemories}`,
+      memories: limitedMemories,
+    });
+  } catch (error) {
+    console.error('[Memory API] List error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+console.log('[√] Memory API endpoints configured');
+console.log('    POST /api/memory/save');
+console.log('    POST /api/memory/recall');
+console.log('    POST /api/memory/list');
+
+// ============================================================================
 // COPILOTKIT RUNTIME
 // ============================================================================
+
+// ============================================================================
+// MEMORY STORAGE (Server-Side)
+// ============================================================================
+// Simple in-memory store for agent memories. Can be replaced with a database.
+interface Memory {
+  id: string;
+  content: string;
+  category: string;
+  timestamp: string;
+  userId: string;
+}
+
+const memoryStore = new Map<string, Memory[]>();
+
+function getUserMemories(userId: string): Memory[] {
+  if (!memoryStore.has(userId)) {
+    memoryStore.set(userId, []);
+  }
+  return memoryStore.get(userId)!;
+}
+
+// Simple semantic similarity using word overlap (can be replaced with embeddings)
+function calculateSimilarity(text1: string, text2: string): number {
+  const words1 = new Set(text1.toLowerCase().split(/\s+/));
+  const words2 = new Set(text2.toLowerCase().split(/\s+/));
+  const intersection = [...words1].filter(w => words2.has(w));
+  const union = new Set([...words1, ...words2]);
+  return intersection.length / union.size;
+}
+
+console.log('[√] Memory storage initialized (in-memory)');
 
 // ============================================================================
 // LANGGRAPH DEPLOYMENT CONFIGURATION
@@ -329,7 +505,9 @@ if (!USE_LOCAL_LANGGRAPH && !LANGSMITH_API_KEY) {
 }
 
 // Select which orchestrator to use
-const ORCHESTRATOR_AGENT = process.env.ORCHESTRATOR_AGENT || 'orchestrator_deep';
+// - 'orchestrator': CopilotKit Supervisor Pattern with subgraphs (Command-based routing)
+// - 'orchestrator_deep': createAgent with middleware (legacy)
+const ORCHESTRATOR_AGENT = process.env.ORCHESTRATOR_AGENT || 'orchestrator';
 
 console.log('[√] Configuring CopilotKit agents...');
 console.log(`    [AGENT LOCK MODE] Locked to: ${ORCHESTRATOR_AGENT}`);
@@ -338,23 +516,39 @@ console.log(`    Agent: ${ORCHESTRATOR_AGENT} @ ${LANGGRAPH_URL}`);
 
 app.use('/copilotkit', (req, res, next) => {
   // ============================================================================
-  // DEEP AGENT ORCHESTRATOR MODE
+  // COPILOTKIT SUPERVISOR PATTERN
   // ============================================================================
-  // CopilotKit is configured to work with the orchestrator_deep agent which
-  // uses langchain createAgent with SubAgentMiddleware for subagent delegation.
-  // The frontend-actions subagent handles all CopilotKit frontend tools.
+  // Available agents:
+  // - 'orchestrator': CopilotKit Supervisor Pattern with StateGraph subgraphs
+  //   Uses Command({ goto: ... }) for routing to 11 specialized sub-agents
+  // - 'orchestrator_deep': createAgent with middleware (legacy)
   // ============================================================================
   const runtime = new CopilotRuntime({
     agentLock: ORCHESTRATOR_AGENT,
     agents: {
+      // PRIMARY: CopilotKit Supervisor Pattern with subgraphs
+      'orchestrator': new LangGraphAgent({
+        deploymentUrl: LANGGRAPH_URL,
+        langsmithApiKey: LANGSMITH_API_KEY,
+        graphId: 'orchestrator',
+        description: `CopilotKit Supervisor Pattern with 11 specialized sub-agent subgraphs:
+- Supervisor uses Command({ goto: ... }) for routing
+- Sub-agents filter CopilotKit tools to their specific subset
+- Each sub-agent streams directly to CopilotKit
+- Creative: strategist, researcher, architect, writer, visual_designer
+- Tools: project_agent, node_agent, data_agent, document_agent, media_agent, framework_agent`,
+        config: {
+          recursion_limit: 150,
+          recursionLimit: 150,
+        },
+      }),
+      // LEGACY: createAgent with middleware
       'orchestrator_deep': new LangGraphAgent({
         deploymentUrl: LANGGRAPH_URL,
         langsmithApiKey: LANGSMITH_API_KEY,
         graphId: 'orchestrator_deep',
-        description: `Deep Agent orchestrator using langchain createAgent with SubAgentMiddleware:
-- Uses deepagents pattern with subagent delegation via task() tool
-- frontend-actions subagent handles all CopilotKit frontend tools
-- Context isolation keeps main agent clean
+        description: `Deep Agent orchestrator using langchain createAgent with middleware:
+- Uses wrapModelCall middleware for CopilotKit tool injection
 - Supports navigation, project/node management, table view, documents, media`,
         config: {
           recursion_limit: 150,
@@ -362,6 +556,11 @@ app.use('/copilotkit', (req, res, next) => {
         },
       }),
     },
+    // NOTE: Server actions (CopilotRuntime.actions) don't work properly with
+    // LangGraph agents - tool_result messages aren't returned correctly.
+    // Memory tools are now implemented as:
+    // 1. API endpoints: /api/memory/save, /api/memory/recall, /api/memory/list
+    // 2. Frontend actions: useCopilotAction hooks that call the API
     middleware: {
       onBeforeRequest: (options) => {
         const startTime = Date.now();
@@ -425,8 +624,12 @@ app.listen(4000, () => {
   console.log('='.repeat(60));
   console.log('  URL: http://localhost:4000/copilotkit');
   console.log(`  Active Agent: ${ORCHESTRATOR_AGENT}`);
-  console.log('  Pattern: Deep Agent with SubAgentMiddleware');
-  console.log('  Sub-agent: frontend-actions (CopilotKit tools)');
+  if (ORCHESTRATOR_AGENT === 'orchestrator') {
+    console.log('  Pattern: CopilotKit Supervisor + Subgraphs');
+    console.log('  Sub-agents: 11 specialized subgraphs');
+  } else {
+    console.log('  Pattern: createAgent + middleware (legacy)');
+  }
   console.log(`  LangGraph: ${LANGGRAPH_URL}`);
   console.log(`  Mode: ${USE_LOCAL_LANGGRAPH ? 'LOCAL' : 'LANGSMITH CLOUD'}`);
   console.log('  Model: claude-sonnet-4-20250514');

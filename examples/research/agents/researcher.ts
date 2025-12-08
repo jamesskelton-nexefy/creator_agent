@@ -476,6 +476,21 @@ Structure your findings as a research brief:
 - Keep context size manageable - summarize rather than dump raw content
 - **Always end with [DONE] when your research is complete**
 
+## IMPORTANT: State vs Memory
+
+**DO NOT use saveMemory for your research findings.**
+
+Your JSON output is automatically parsed and stored in agent state as \`researchFindings\`. This state is:
+- Automatically passed to other agents (Architect, Writer)
+- Available for the entire session
+- The correct way to share research data
+
+saveMemory is ONLY for:
+- User preferences that should persist across sessions
+- Historical project summaries AFTER a project is completed
+
+If you call saveMemory with research findings, you're duplicating data and potentially causing inconsistency.
+
 Remember: Quality research leads to impactful training. Be efficient and focused.`;
 
 // ============================================================================
@@ -649,6 +664,21 @@ The user is waiting for research results.`,
     console.log("  [researcher] MAX ITERATIONS reached - forcing completion");
   }
 
+  // Parse research findings on completion
+  let parsedFindings: ResearchBrief | null = null;
+  if (isResearchComplete || forceComplete) {
+    parsedFindings = parseResearchFindings(responseText);
+    if (parsedFindings) {
+      console.log("  [researcher] Parsed research findings:", {
+        topicsCount: parsedFindings.keyTopics.length,
+        regulationsCount: parsedFindings.regulations.length,
+        citationsCount: parsedFindings.citations.length,
+      });
+    } else {
+      console.log("  [researcher] WARNING: Could not parse structured research findings from response");
+    }
+  }
+
   return {
     messages: [response],
     currentAgent: "researcher",
@@ -657,6 +687,8 @@ The user is waiting for research results.`,
     routingDecision: null,
     // Update iteration count (reset to 0 if complete, otherwise increment)
     researchIterationCount: isResearchComplete ? 0 : currentIteration,
+    // Include parsed research findings if available
+    ...(parsedFindings && { researchFindings: parsedFindings }),
   };
 }
 

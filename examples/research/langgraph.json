@@ -1,8 +1,20 @@
 {
-  "$comment": "Multi-agent orchestrator system with specialized sub-agents",
+  "$comment": "Multi-agent orchestrator with CopilotKit supervisor pattern and subgraphs",
   "dependencies": ["."],
   "graphs": {
+    "orchestrator": "./orchestrator-agent.ts:agent",
     "orchestrator_deep": "./orchestrator-agent-deep.ts:agent"
   },
-  "env": ".env"
+  "env": ".env",
+  "store": {
+    "index": {
+      "embed": "openai:text-embedding-3-small",
+      "dims": 1536,
+      "fields": ["$"]
+    },
+    "ttl": {
+      "refresh_on_read": true,
+      "default_ttl": 10080
+    }
+  }
 }

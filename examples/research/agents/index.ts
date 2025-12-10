@@ -22,6 +22,7 @@ export {
   suggestThemes,
   DESIGN_THEMES,
 } from "./visual-designer";
+export { builderAgentNode } from "./builder-agent";
 
 // Tool-specialized sub-agents (for reduced payload architecture)
 // Each filters CopilotKit tools to its specific subset

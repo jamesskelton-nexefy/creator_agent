@@ -28,15 +28,15 @@ import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 
 /** Default token limits for different agent types */
 export const TOKEN_LIMITS = {
-  orchestrator: 100000,
-  subAgent: 50000,
+  orchestrator: 60000,  // Reduced from 100k to encourage earlier trimming
+  subAgent: 30000,      // Reduced from 50k
   summary: 2000,
 } as const;
 
 /** Default message counts for fallback when token counting unavailable */
 export const MESSAGE_LIMITS = {
-  orchestrator: 40,
-  subAgent: 15,
+  orchestrator: 25,     // Reduced from 40 - keeps context tighter
+  subAgent: 10,         // Reduced from 15
 } as const;
 
 // ============================================================================
@@ -180,6 +180,10 @@ export function filterOrphanedToolResults(
   // Both have the SAME tool_call IDs, causing Anthropic API errors
   const processedToolCallIds = new Set<string>();
 
+  // Track tool_call_ids that already have a ToolMessage result
+  // Anthropic API requires exactly ONE tool_result per tool_use
+  const processedToolResultIds = new Set<string>();
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const msgType = getMessageType(msg);
@@ -247,14 +251,33 @@ export function filterOrphanedToolResults(
           continue;
         }
 
-        // No resolved tool_calls - only keep if has text content
-        // (fall through to content check below)
+        // No resolved tool_calls - if has text content, strip the unresolved tool_calls
+        if (hasNonEmptyTextContent(aiMsg)) {
+          // Create new message without tool_calls to prevent API errors
+          const newAiMsg = new AIMessage({
+            content: aiMsg.content,
+            id: aiMsg.id,
+            name: aiMsg.name,
+            // Explicitly omit tool_calls since they're all unresolved
+          });
+          filtered.push(newAiMsg);
+          console.log(
+            `  ${prefix}[FILTER] Stripped ${unresolvedToolCalls.length} unresolved tool_calls from AI message with content: ${unresolvedToolCalls.map((tc) => tc.name).join(", ")}`
+          );
+          continue;
+        }
+        
+        // No resolved tool_calls AND no text content - remove entirely
+        console.log(
+          `  ${prefix}[FILTER] Removing AI message with no content and no resolved tool_calls`
+        );
+        continue;
       }
 
       // Filter AI messages with empty text content (only thinking blocks)
       if (!hasNonEmptyTextContent(aiMsg)) {
         console.log(
-          `  ${prefix}[FILTER] Removing AI message with no content and no resolved tool_calls`
+          `  ${prefix}[FILTER] Removing AI message with empty content`
         );
         continue;
       }
@@ -263,30 +286,50 @@ export function filterOrphanedToolResults(
     }
 
     // Filter orphaned tool_result messages (results without matching tool_use)
+    // CRITICAL: Anthropic requires tool_result to match tool_use in IMMEDIATELY preceding assistant message
+    // Multiple consecutive ToolMessages can follow one AIMessage (valid), but the AIMessage must be adjacent
     if (msgType === "tool" || msgType === "ToolMessage") {
       const toolMsg = msg as ToolMessage;
       const toolCallId = toolMsg.tool_call_id;
 
+      // Check for duplicate tool results (same tool_call_id)
+      // Anthropic API requires exactly ONE tool_result per tool_use
+      if (processedToolResultIds.has(toolCallId)) {
+        console.log(`  ${prefix}[FILTER] Removing duplicate tool result for: ${toolCallId}`);
+        continue;
+      }
+
       let hasMatchingToolUse = false;
-      // Search ALL previous AI messages for matching tool_use (not just the most recent)
+      
+      // Find the most recent non-tool message (must be an AI message with matching tool_use)
+      // We allow consecutive ToolMessages because they all reference the same preceding AIMessage
       for (let j = filtered.length - 1; j >= 0; j--) {
         const prevMsg = filtered[j];
         const prevType = getMessageType(prevMsg);
 
+        // Skip other tool messages (consecutive tool results from same AI message are valid)
+        if (prevType === "tool" || prevType === "ToolMessage") {
+          continue;
+        }
+
+        // Found a non-tool message - must be an AI message with matching tool_use
         if (prevType === "ai" || prevType === "AIMessage" || prevType === "AIMessageChunk") {
           const aiMsg = prevMsg as AIMessage;
           if (aiMsg.tool_calls?.some((tc) => tc.id === toolCallId)) {
             hasMatchingToolUse = true;
-            break; // Found matching tool_use, stop searching
           }
-          // Continue searching older AI messages (don't break here)
         }
+        // Only check the immediately preceding non-tool message (strict adjacency)
+        break;
       }
 
       if (!hasMatchingToolUse) {
-        console.log(`  ${prefix}[FILTER] Removing orphaned tool result: ${toolCallId}`);
+        console.log(`  ${prefix}[FILTER] Removing orphaned tool result (no adjacent tool_use): ${toolCallId}`);
         continue;
       }
+
+      // Mark this tool_call_id as having a result
+      processedToolResultIds.add(toolCallId);
     }
 
     filtered.push(msg);
@@ -664,6 +707,287 @@ export async function summarizeIfNeeded(
 }
 
 // ============================================================================
+// COMPRESS TOOL RESULTS (Reduce Token Usage)
+// ============================================================================
+
+/**
+ * Tool-specific compression rules that transform verbose tool results into concise summaries.
+ * Each function receives the raw tool result content and returns a compressed version.
+ */
+export type ToolCompressionRule = (content: string) => string;
+
+export interface CompressToolResultsOptions {
+  /** Number of most recent tool results to keep full (not compressed) */
+  keepFullResultsCount?: number;
+  /** Custom compression rules by tool name */
+  compressionRules?: Record<string, ToolCompressionRule>;
+  /** Maximum length for tool results before compression (chars) */
+  maxResultLength?: number;
+  /** Log prefix for debugging */
+  logPrefix?: string;
+}
+
+/**
+ * Default compression rules for common verbose tools.
+ * These extract key information while dramatically reducing token count.
+ */
+const DEFAULT_COMPRESSION_RULES: Record<string, ToolCompressionRule> = {
+  // Template tools - extract just the count and names
+  getAvailableTemplates: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      const templates = data.templates || [];
+      const names = templates.slice(0, 5).map((t: any) => t.name).join(', ');
+      const more = templates.length > 5 ? ` (+${templates.length - 5} more)` : '';
+      return `[${templates.length} templates: ${names}${more}]`;
+    } catch {
+      return `[Templates data - ${content.length} chars]`;
+    }
+  },
+  
+  getNodeTemplateFields: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      const fields = data.fields || [];
+      const fieldNames = fields.map((f: any) => f.label || f.name).join(', ');
+      return `[Template "${data.templateName}": ${fields.length} fields - ${fieldNames}]`;
+    } catch {
+      return `[Template fields - ${content.length} chars]`;
+    }
+  },
+  
+  // Image generation - keep just the file ID and title
+  generateAIImage: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      if (data.success && data.file) {
+        return `[Image generated: id="${data.file.id}", title="${data.file.title}"]`;
+      }
+      return `[Image generation result - ${content.length} chars]`;
+    } catch {
+      return `[Image result - ${content.length} chars]`;
+    }
+  },
+  
+  // Node operations - keep key identifiers
+  getNodeDetails: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      return `[Node "${data.title || data.name}" (id: ${data.id}, type: ${data.nodeType})]`;
+    } catch {
+      return `[Node details - ${content.length} chars]`;
+    }
+  },
+  
+  getNodeChildren: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      const children = data.children || data.nodes || [];
+      const names = children.slice(0, 3).map((c: any) => c.title || c.name).join(', ');
+      const more = children.length > 3 ? ` (+${children.length - 3} more)` : '';
+      return `[${children.length} children: ${names}${more}]`;
+    } catch {
+      return `[Children data - ${content.length} chars]`;
+    }
+  },
+  
+  getNodesByLevel: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      const nodes = data.nodes || [];
+      const names = nodes.slice(0, 3).map((n: any) => n.title || n.name).join(', ');
+      const more = nodes.length > 3 ? ` (+${nodes.length - 3} more)` : '';
+      return `[${nodes.length} nodes at level: ${names}${more}]`;
+    } catch {
+      return `[Level nodes - ${content.length} chars]`;
+    }
+  },
+  
+  // Project/hierarchy info - summarize key fields
+  getProjectHierarchyInfo: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      const levels = data.hierarchyLevels || data.levels || [];
+      const levelNames = levels.map((l: any) => l.name).join(' > ');
+      return `[Hierarchy: ${levels.length} levels - ${levelNames}]`;
+    } catch {
+      return `[Hierarchy info - ${content.length} chars]`;
+    }
+  },
+  
+  getCurrentProject: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      return `[Project: "${data.name}" (id: ${data.id})]`;
+    } catch {
+      return `[Project info - ${content.length} chars]`;
+    }
+  },
+  
+  // Search results - summarize
+  searchMicroverse: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      const results = data.results || data.files || [];
+      return `[${results.length} media files found]`;
+    } catch {
+      return `[Search results - ${content.length} chars]`;
+    }
+  },
+  
+  // Node creation - keep the created node ID
+  createNode: (content: string) => {
+    try {
+      const data = JSON.parse(content);
+      if (data.success || data.nodeId || data.id) {
+        const nodeId = data.nodeId || data.id || data.node?.id;
+        const title = data.title || data.node?.title || 'untitled';
+        return `[Node created: "${title}" (id: ${nodeId})]`;
+      }
+      return `[Create node result - ${content.length} chars]`;
+    } catch {
+      return `[Create result - ${content.length} chars]`;
+    }
+  },
+  
+  // Edit mode - simple status
+  requestEditMode: (content: string) => {
+    if (content.toLowerCase().includes('success')) {
+      return '[Edit mode acquired]';
+    }
+    return `[Edit mode: ${content.substring(0, 100)}]`;
+  },
+  
+  releaseEditMode: (content: string) => {
+    return '[Edit mode released]';
+  },
+};
+
+/**
+ * Compresses older tool results to reduce token usage.
+ * Keeps the most recent tool results full, compresses older ones using tool-specific rules.
+ * 
+ * This dramatically reduces context size for conversations with many tool calls,
+ * particularly for verbose tools like getAvailableTemplates, generateAIImage, etc.
+ * 
+ * @param messages - Messages to process
+ * @param options - Compression options
+ * @returns Messages with older tool results compressed
+ */
+export function compressToolResults(
+  messages: BaseMessage[],
+  options: CompressToolResultsOptions = {}
+): BaseMessage[] {
+  const {
+    keepFullResultsCount = 2,
+    compressionRules = {},
+    maxResultLength = 1000,
+    logPrefix = "",
+  } = options;
+
+  const prefix = logPrefix ? `${logPrefix} ` : "";
+  
+  // Merge custom rules with defaults
+  const allRules: Record<string, ToolCompressionRule> = {
+    ...DEFAULT_COMPRESSION_RULES,
+    ...compressionRules,
+  };
+
+  // Find all tool result messages (from newest to oldest)
+  const toolResultIndices: { index: number; toolName: string; length: number }[] = [];
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const msgType = getMessageType(msg);
+
+    if (msgType === "tool" || msgType === "ToolMessage") {
+      const toolMsg = msg as ToolMessage;
+      const contentLength = typeof toolMsg.content === 'string' 
+        ? toolMsg.content.length 
+        : JSON.stringify(toolMsg.content).length;
+      toolResultIndices.push({ 
+        index: i, 
+        toolName: toolMsg.name || 'unknown',
+        length: contentLength,
+      });
+    }
+  }
+
+  // If we have fewer tool results than keepFullResultsCount, nothing to compress
+  if (toolResultIndices.length <= keepFullResultsCount) {
+    return messages;
+  }
+
+  // Identify which tool results to compress (older ones)
+  const toCompress = new Set<number>();
+  let keptCount = 0;
+
+  for (const { index, length } of toolResultIndices) {
+    if (keptCount < keepFullResultsCount) {
+      keptCount++;
+    } else if (length > maxResultLength) {
+      // Only compress if over the length threshold
+      toCompress.add(index);
+    }
+  }
+
+  if (toCompress.size === 0) {
+    return messages;
+  }
+
+  let compressedCount = 0;
+  let savedChars = 0;
+
+  // Build new message array with compressed tool results
+  const result: BaseMessage[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    if (toCompress.has(i)) {
+      const toolMsg = msg as ToolMessage;
+      const toolName = toolMsg.name || 'unknown';
+      const originalContent = typeof toolMsg.content === 'string' 
+        ? toolMsg.content 
+        : JSON.stringify(toolMsg.content);
+      
+      // Apply compression rule
+      let compressedContent: string;
+      if (allRules[toolName]) {
+        compressedContent = allRules[toolName](originalContent);
+      } else {
+        // Default compression: truncate with length indicator
+        compressedContent = originalContent.length > 200
+          ? `${originalContent.substring(0, 200)}... [truncated, ${originalContent.length} chars total]`
+          : originalContent;
+      }
+      
+      savedChars += originalContent.length - compressedContent.length;
+      compressedCount++;
+
+      result.push(
+        new ToolMessage({
+          content: compressedContent,
+          tool_call_id: toolMsg.tool_call_id,
+          name: toolMsg.name,
+        })
+      );
+      continue;
+    }
+
+    result.push(msg);
+  }
+
+  if (compressedCount > 0) {
+    console.log(
+      `  ${prefix}[COMPRESS] Compressed ${compressedCount} tool results, saved ~${Math.round(savedChars / 4)} tokens (${savedChars} chars)`
+    );
+  }
+
+  return result;
+}
+
+// ============================================================================
 // CLEAR OLD TOOL RESULTS
 // ============================================================================
 
@@ -845,6 +1169,12 @@ export interface ProcessContextOptions {
   toolKeepCount?: number;
   /** Tools to exclude from clearing */
   excludeTools?: string[];
+  /** Whether to compress verbose tool results */
+  enableToolCompression?: boolean;
+  /** Number of recent tool results to keep full (not compressed) */
+  compressionKeepCount?: number;
+  /** Max length for tool results before compression */
+  compressionMaxLength?: number;
   /** Log prefix */
   logPrefix?: string;
 }
@@ -853,13 +1183,14 @@ export interface ProcessContextOptions {
  * Processes context by applying multiple strategies in sequence:
  * 1. Filter orphaned tool results (pre-trim cleanup)
  * 2. Repair dangling tool calls (create synthetic results for interrupted calls)
- * 3. Clear old tool results (if enabled)
- * 4. Summarize (if enabled)
- * 5. Trim to token/message limit
- * 6. Filter orphaned tool results again (post-trim cleanup)
- * 7. Repair dangling tool calls again (post-trim)
+ * 3. Compress verbose tool results (if enabled) - REDUCES TOKEN USAGE
+ * 4. Clear old tool results (if enabled)
+ * 5. Summarize (if enabled)
+ * 6. Trim to token/message limit
+ * 7. Filter orphaned tool results again (post-trim cleanup)
+ * 8. Repair dangling tool calls again (post-trim)
  *
- * Steps 6-7 are critical: trimMessages() fallback can create new orphans/danglers
+ * Steps 7-8 are critical: trimMessages() fallback can create new orphans/danglers
  * when no valid start point is found and it falls back to keeping last N messages.
  *
  * This follows LangGraph's "Deep Agents Harness" patterns:
@@ -884,6 +1215,9 @@ export async function processContext(
     enableToolClearing = false,
     toolKeepCount = 5,
     excludeTools = [],
+    enableToolCompression = false,
+    compressionKeepCount = 2,
+    compressionMaxLength = 1000,
     logPrefix = "",
   } = options;
 
@@ -898,7 +1232,18 @@ export async function processContext(
   // This follows LangGraph Deep Agents "Dangling Tool Call Repair" pattern
   processed = repairDanglingToolCalls(processed, logPrefix);
 
-  // Step 3: Clear old tool results (if enabled)
+  // Step 3: Compress verbose tool results (if enabled)
+  // This dramatically reduces token usage for tools like getAvailableTemplates,
+  // generateAIImage, etc. that return large JSON payloads
+  if (enableToolCompression) {
+    processed = compressToolResults(processed, {
+      keepFullResultsCount: compressionKeepCount,
+      maxResultLength: compressionMaxLength,
+      logPrefix,
+    });
+  }
+
+  // Step 4: Clear old tool results (if enabled)
   if (enableToolClearing) {
     processed = clearOldToolResults(processed, {
       keepCount: toolKeepCount,
@@ -907,7 +1252,7 @@ export async function processContext(
     });
   }
 
-  // Step 4: Summarize (if enabled)
+  // Step 5: Summarize (if enabled)
   if (enableSummarization) {
     processed = await summarizeIfNeeded(processed, {
       triggerTokens: summarizeTriggerTokens,
@@ -916,7 +1261,7 @@ export async function processContext(
     });
   }
 
-  // Step 5: Trim to limit
+  // Step 6: Trim to limit
   processed = await trimMessages(processed, {
     maxTokens,
     model,
@@ -924,12 +1269,12 @@ export async function processContext(
     logPrefix,
   });
 
-  // Step 6: Filter orphaned tool results AGAIN (post-trim)
+  // Step 7: Filter orphaned tool results AGAIN (post-trim)
   // This catches orphans created by trimMessages() fallback logic
   // when it keeps last N messages without respecting tool_use/tool_result pairs
   processed = filterOrphanedToolResults(processed, logPrefix);
 
-  // Step 7: Repair dangling tool calls AGAIN (post-trim)
+  // Step 8: Repair dangling tool calls AGAIN (post-trim)
   // This catches danglers created when trimming removes ToolMessages
   // but keeps their corresponding AIMessage with tool_calls
   processed = repairDanglingToolCalls(processed, logPrefix);

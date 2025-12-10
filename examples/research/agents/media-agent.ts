@@ -2,13 +2,14 @@
  * Media Agent
  *
  * Specialized agent for media library (Microverse) operations.
- * Handles searching, viewing, and attaching media assets to content nodes.
+ * Handles searching, viewing, generating AI images, and attaching media assets to content nodes.
  *
  * Tools (Frontend):
  * - searchMicroverse - Search media assets
  * - getMicroverseDetails - Get detailed asset info
  * - getMicroverseUsage - Check where an asset is used
  * - generateMicroverseAssets - Generate new assets from images
+ * - generateAIImage - Generate AI images using nano-banana-pro
  * - attachMicroverseToNode - Attach media to a node field
  * - detachMicroverseFromNode - Remove media from a node
  * - getNodeMicroverseFields - List media fields on a node
@@ -72,6 +73,20 @@ You help users find, manage, and attach media assets (images, videos, documents,
   - Uploads from /images/ folder to the library
   - Registers metadata in the database
 
+### AI Image Generation
+- **generateAIImage(prompt, preset?, aspectRatio?, title?, description?, tags?)** - Generate AI images
+  - Uses Google's nano-banana-pro model via Replicate
+  - **Presets for eLearning:**
+    - "banner" (21:9) - Course/module banners and headers
+    - "hero" (16:9) - Hero images and presentation slides
+    - "content" (16:9) - General content illustrations
+    - "thumbnail" (3:2) - Card thumbnails and previews
+    - "square" (1:1) - Icons, avatars, social media
+    - "portrait" (3:4) - Character portraits, person photos
+    - "custom" - Use custom aspectRatio parameter
+  - Automatically stores generated images in Microverse
+  - Deduplicates identical images by hash
+
 ### Attaching Media to Nodes
 - **getNodeMicroverseFields(nodeId?)** - List media fields on a node
   - Shows which fields can accept media
@@ -104,6 +119,22 @@ User: "Is this image used anywhere?"
 ### Viewing All Media
 User: "Show me all videos in the library"
 → Call searchMicroverse({ fileType: "video" })
+
+### Generating AI Images
+User: "Create a banner image of a modern office with people collaborating"
+→ Call generateAIImage({ 
+    prompt: "Modern open office space with diverse professionals collaborating around a whiteboard, natural lighting, warm colors, professional photography style",
+    preset: "banner",
+    title: "Collaboration Banner",
+    description: "AI generated office collaboration scene"
+  })
+
+User: "Generate a thumbnail showing workplace safety"
+→ Call generateAIImage({
+    prompt: "Workplace safety equipment including hard hat, safety vest, and protective glasses on a clean background, professional product photography",
+    preset: "thumbnail",
+    title: "Safety Equipment Thumbnail"
+  })
 
 ## Communication Style
 
@@ -209,5 +240,9 @@ The user is waiting for media library information.`,
 }
 
 export default mediaAgentNode;
+
+
+
+
 
 

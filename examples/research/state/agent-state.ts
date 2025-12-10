@@ -5,9 +5,41 @@
  * Each agent reads from and writes to specific keys in this shared state.
  */
 
-import { Annotation } from "@langchain/langgraph";
+import { Annotation, messagesStateReducer } from "@langchain/langgraph";
 import { CopilotKitStateAnnotation } from "@copilotkit/sdk-js/langgraph";
 import { BaseMessage } from "@langchain/core/messages";
+
+// ============================================================================
+// BOUNDED MESSAGES CONFIGURATION
+// ============================================================================
+
+/**
+ * Maximum number of messages to keep in state.
+ * This prevents "RangeError: Invalid string length" during JSON serialization
+ * by FileSystemPersistence (langgraph-cli dev mode).
+ * 
+ * Set conservatively to prevent state explosion while maintaining enough
+ * context for effective agent operation.
+ */
+const MAX_MESSAGES_IN_STATE = 100;
+
+/**
+ * Maximum number of written content entries to keep.
+ * Prevents unbounded accumulation in long sessions.
+ */
+const MAX_WRITTEN_CONTENT = 200;
+
+/**
+ * Maximum number of created nodes to track.
+ * Prevents unbounded accumulation in long sessions.
+ */
+const MAX_CREATED_NODES = 200;
+
+/**
+ * Maximum number of generated previews to keep.
+ * Prevents unbounded accumulation in long sessions.
+ */
+const MAX_GENERATED_PREVIEWS = 50;
 
 // ============================================================================
 // TYPE DEFINITIONS - Structured outputs from each agent
@@ -150,6 +182,78 @@ export interface PlannedNode {
 }
 
 /**
+ * Image style configuration for a specific image type.
+ */
+export interface ImageStyleConfig {
+  /** Image type: photo, illustration, 3d, icon */
+  type: "photo" | "illustration" | "3d" | "icon";
+  /** Style variant within the type */
+  style: string;
+  /** Additional style settings */
+  lighting?: string;
+  mood?: string;
+  complexity?: "simple" | "medium" | "detailed";
+}
+
+/**
+ * Extended color system beyond basic palette.
+ */
+export interface ColorSystemConfig {
+  /** Primary gradient (Tailwind format) */
+  gradientPrimary?: string;
+  /** Secondary gradient */
+  gradientSecondary?: string;
+  /** Card/surface background color */
+  surfaceCard?: string;
+  /** Elevated surface color */
+  surfaceElevated?: string;
+  /** Shadow intensity level */
+  shadowIntensity?: "none" | "subtle" | "medium" | "strong";
+}
+
+/**
+ * Layout and spacing preferences.
+ */
+export interface LayoutConfig {
+  /** Container padding level */
+  containerPadding: "compact" | "normal" | "spacious";
+  /** Border radius style */
+  borderRadius: "none" | "subtle" | "rounded" | "pill";
+  /** Card component style */
+  cardStyle: "flat" | "elevated" | "outlined" | "glass";
+}
+
+/**
+ * Animation preferences for components.
+ */
+export interface AnimationConfig {
+  /** Whether animations are enabled */
+  enabled: boolean;
+  /** Animation intensity */
+  style?: "subtle" | "moderate" | "dynamic";
+  /** Animation speed */
+  duration?: "fast" | "normal" | "slow";
+  /** Entrance animation type */
+  entranceType?: "fade" | "slide" | "scale";
+  /** Duration in milliseconds */
+  durationMs?: number;
+}
+
+/**
+ * Component-level style preferences.
+ */
+export interface ComponentPreferences {
+  /** Header/title block style */
+  headerStyle?: "minimal" | "gradient" | "hero" | "split";
+  /** Question block style */
+  questionStyle?: "standard" | "card" | "gamified";
+  /** CTA/action button style */
+  ctaStyle?: "solid" | "outline" | "gradient";
+  /** Text block style */
+  textStyle?: "standard" | "callout" | "quote" | "two-column";
+}
+
+/**
  * Visual design specification from the Visual Designer agent.
  */
 export interface VisualDesign {
@@ -183,6 +287,72 @@ export interface VisualDesign {
   };
   /** Additional style notes */
   notes?: string;
+  
+  // ========== EXTENDED DESIGN SYSTEM ==========
+  
+  /**
+   * Image styles - array to support multiple types (e.g., photos AND illustrations).
+   * Each entry specifies a type and the selected style variant within that type.
+   */
+  imageStyles?: ImageStyleConfig[];
+  
+  /**
+   * Extended color system with gradients and surfaces.
+   */
+  colorSystem?: ColorSystemConfig;
+  
+  /**
+   * Layout and spacing preferences.
+   */
+  layout?: LayoutConfig;
+  
+  /**
+   * Animation preferences for components.
+   */
+  animation?: AnimationConfig;
+  
+  /**
+   * Component-level style preferences.
+   */
+  componentPreferences?: ComponentPreferences;
+}
+
+/**
+ * Generated preview component from Builder Agent.
+ * Represents a rendered e-learning component for a content node.
+ */
+export interface GeneratedPreview {
+  /** The content node ID this preview is for */
+  nodeId: string;
+  /** Component type (TitleBlock, QuestionBlock, etc.) */
+  componentType: string;
+  /** Props to pass to the component */
+  props: Record<string, any>;
+  /** Optional raw HTML output */
+  html?: string;
+  /** Optional CSS styles */
+  css?: string;
+  /** When this preview was generated */
+  generatedAt: string;
+  /** Version number (incremented on updates) */
+  version: number;
+  /** User instructions that led to this version */
+  userInstructions?: string;
+}
+
+/**
+ * Preview generation state from Builder Agent.
+ * Tracks all generated previews and current preview mode.
+ */
+export interface PreviewState {
+  /** All generated previews indexed by nodeId */
+  generatedPreviews: GeneratedPreview[];
+  /** Currently focused node ID */
+  currentNodeId: string | null;
+  /** Preview mode: single node or flow of nodes */
+  previewMode: 'single' | 'flow';
+  /** Last update timestamp */
+  lastUpdated: string;
 }
 
 /**
@@ -229,6 +399,7 @@ export type AgentType =
   | "architect" 
   | "writer" 
   | "visual_designer"
+  | "builder_agent"
   // Tool-specialized sub-agents
   | "project_agent"
   | "node_agent"
@@ -305,21 +476,48 @@ export const STRATEGIST_PHASES = {
 
 /**
  * Phase definitions for the Visual Designer agent.
- * Controls workflow: gather preferences → present options → finalize design
+ * Controls workflow:
+ *   gather preferences → select image types → select styles → 
+ *   select colors/typography → select animations/components → finalize
  */
 export const VISUAL_DESIGNER_PHASES = {
   gathering_preferences: {
-    description: "Understanding design preferences and requirements",
+    description: "Understanding basic design preferences and requirements",
     allowedTools: ["offerOptions", "askClarifyingQuestions", "searchMicroverse"],
-    nextPhase: "presenting_options",
+    nextPhase: "selecting_image_types",
   },
-  presenting_options: {
-    description: "Presenting design theme options to the user",
-    allowedTools: ["offerOptions", "searchMicroverse", "getMicroverseDetails"],
+  selecting_image_types: {
+    description: "User selects which image types to use (photos, illustrations, 3D, icons)",
+    allowedTools: ["selectImageTypes"],
+    nextPhase: "selecting_image_styles",
+  },
+  selecting_image_styles: {
+    description: "User selects specific styles for each chosen image type",
+    allowedTools: ["selectAllImageStyles"],
+    nextPhase: "selecting_colors",
+  },
+  selecting_colors: {
+    description: "User selects color palette",
+    allowedTools: ["selectColorPalette"],
+    nextPhase: "selecting_typography",
+  },
+  selecting_typography: {
+    description: "User selects typography/font pairing",
+    allowedTools: ["selectTypography"],
+    nextPhase: "selecting_animations",
+  },
+  selecting_animations: {
+    description: "User selects animation style",
+    allowedTools: ["selectAnimationStyle"],
+    nextPhase: "selecting_components",
+  },
+  selecting_components: {
+    description: "User selects component style preferences",
+    allowedTools: ["selectComponentStyles"],
     nextPhase: "finalizing",
   },
   finalizing: {
-    description: "Finalizing the design specification - no tool calls allowed",
+    description: "Finalizing the design specification - compiling all selections",
     allowedTools: [],
     nextPhase: "complete",
   },
@@ -415,6 +613,24 @@ export const OrchestratorStateAnnotation = Annotation.Root({
   // Inherit CopilotKit state (messages, actions, context)
   ...CopilotKitStateAnnotation.spec,
 
+  // ---- OVERRIDE: Bounded Messages Reducer ----
+  // Override the default messages reducer with one that caps at MAX_MESSAGES_IN_STATE
+  // This prevents state explosion that causes "RangeError: Invalid string length"
+  // during JSON serialization by FileSystemPersistence (langgraph-cli dev mode)
+  messages: Annotation<BaseMessage[]>({
+    reducer: (existing, update) => {
+      // Use standard messagesStateReducer for accumulation
+      const accumulated = messagesStateReducer(existing, update);
+      // Cap at MAX_MESSAGES_IN_STATE to prevent unbounded growth
+      if (accumulated.length > MAX_MESSAGES_IN_STATE) {
+        // Keep most recent messages, preserving conversation flow
+        return accumulated.slice(-MAX_MESSAGES_IN_STATE);
+      }
+      return accumulated;
+    },
+    default: () => [],
+  }),
+
   // ---- Agent Context Outputs ----
 
   /** Project brief from the Strategist */
@@ -455,7 +671,37 @@ export const OrchestratorStateAnnotation = Annotation.Root({
     default: () => null,
   }),
 
-  /** Content outputs from the Writer (accumulates) */
+  /** Preview state from the Builder Agent (previews capped at MAX_GENERATED_PREVIEWS) */
+  previewState: Annotation<PreviewState | null>({
+    reducer: (existing, update) => {
+      if (!update) return existing;
+      if (!existing) return update;
+      // Merge generated previews, keeping newer versions
+      let mergedPreviews = [...existing.generatedPreviews];
+      for (const preview of update.generatedPreviews || []) {
+        const existingIdx = mergedPreviews.findIndex(p => p.nodeId === preview.nodeId);
+        if (existingIdx >= 0) {
+          // Keep newer version
+          if (preview.version > mergedPreviews[existingIdx].version) {
+            mergedPreviews[existingIdx] = preview;
+          }
+        } else {
+          mergedPreviews.push(preview);
+        }
+      }
+      // Cap at MAX_GENERATED_PREVIEWS to prevent unbounded growth
+      if (mergedPreviews.length > MAX_GENERATED_PREVIEWS) {
+        mergedPreviews = mergedPreviews.slice(-MAX_GENERATED_PREVIEWS);
+      }
+      return {
+        ...update,
+        generatedPreviews: mergedPreviews,
+      };
+    },
+    default: () => null,
+  }),
+
+  /** Content outputs from the Writer (accumulates, capped at MAX_WRITTEN_CONTENT) */
   writtenContent: Annotation<ContentOutput[]>({
     reducer: (existing, update) => {
       // Merge new content with existing, avoiding duplicates by nodeId
@@ -465,6 +711,10 @@ export const OrchestratorStateAnnotation = Annotation.Root({
           merged.push(content);
         }
       }
+      // Cap at MAX_WRITTEN_CONTENT to prevent unbounded growth
+      if (merged.length > MAX_WRITTEN_CONTENT) {
+        return merged.slice(-MAX_WRITTEN_CONTENT);
+      }
       return merged;
     },
     default: () => [],
@@ -472,7 +722,7 @@ export const OrchestratorStateAnnotation = Annotation.Root({
 
   // ---- Execution Tracking ----
 
-  /** Track created nodes to prevent duplicates */
+  /** Track created nodes to prevent duplicates (capped at MAX_CREATED_NODES) */
   createdNodes: Annotation<CreatedNode[]>({
     reducer: (existing, update) => {
       const merged = [...(existing || [])];
@@ -480,6 +730,10 @@ export const OrchestratorStateAnnotation = Annotation.Root({
         if (!merged.some((n) => n.nodeId === node.nodeId)) {
           merged.push(node);
         }
+      }
+      // Cap at MAX_CREATED_NODES to prevent unbounded growth
+      if (merged.length > MAX_CREATED_NODES) {
+        return merged.slice(-MAX_CREATED_NODES);
       }
       return merged;
     },

@@ -19,11 +19,14 @@ export {
   trimMessages,
   summarizeIfNeeded,
   clearOldToolResults,
+  compressToolResults,
   processContext,
   // Types
   type TrimMessagesOptions,
   type SummarizeOptions,
   type ClearToolResultsOptions,
+  type CompressToolResultsOptions,
+  type ToolCompressionRule,
   type ProcessContextOptions,
 } from "./context-management";
 

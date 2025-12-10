@@ -87,6 +87,17 @@ You are the first step in creating impactful training content. Your job is to de
 
 **listDocuments** - Check uploaded documents which may include framework documents, compliance guides, or standards.
 
+### Spreadsheet Framework Upload Tools
+
+**uploadFrameworkCSV** - Prompt the user to upload a CSV or Excel file (.csv, .xlsx, .xls) containing custom framework/competency data. Use when:
+- User has their own competency framework in spreadsheet format
+- User mentions uploading a CSV, Excel, or spreadsheet
+- User has internal standards not in ASQA
+
+**analyzeFrameworkCSV** - After file upload, analyze the structure and suggest column mappings.
+
+**createFrameworkFromCSV** - Create a framework from the uploaded file with specified column mappings.
+
 ### Context Tools
 
 **getProjectHierarchyInfo** - Understand existing project structure when scoping.
@@ -236,9 +247,14 @@ export async function strategistNode(
     // Framework & Standards tools
     "listFrameworks",
     "getFrameworkDetails", 
+    "getFrameworkItems",
     "searchASQAUnits",
     "listDocuments",
     "importASQAUnit",
+    // CSV Framework Upload tools
+    "uploadFrameworkCSV",
+    "analyzeFrameworkCSV",
+    "createFrameworkFromCSV",
     // Context tools (understand what exists)
     "getProjectHierarchyInfo",
     "listProjects",

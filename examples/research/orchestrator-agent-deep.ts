@@ -208,6 +208,7 @@ const CORE_ORCHESTRATOR_TOOLS = [
  */
 export const TOOL_CATEGORIES = {
   project: [
+    'getCurrentProject',  // Check current project context FIRST
     'listProjects',
     'getProjectDetails',
     'createProject',
@@ -263,19 +264,30 @@ export const TOOL_CATEGORIES = {
     'getMicroverseDetails',
     'getMicroverseUsage',
     'generateMicroverseAssets',
+    'generateAIImage',
     'attachMicroverseToNode',
     'detachMicroverseFromNode',
     'getNodeMicroverseFields',
   ],
   framework: [
+    'getCurrentProject',  // Check current project context for linking operations
     'listFrameworks',
     'getFrameworkDetails',
+    'getFrameworkItems',
     'searchASQAUnits',
     'getUnitDetails',
+    'importASQAUnit',
     'importFramework',
     'linkFrameworkToProject',
+    'unlinkFrameworkFromProject',
     'mapCriteriaToNode',
+    'unmapCriteriaFromNode',
     'suggestCriteriaMappings',
+    'getNodeCriteriaMappings',
+    // CSV Framework Upload
+    'uploadFrameworkCSV',
+    'analyzeFrameworkCSV',
+    'createFrameworkFromCSV',
   ],
   memory: [
     'saveMemory',

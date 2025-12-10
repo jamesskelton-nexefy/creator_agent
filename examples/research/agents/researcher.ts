@@ -394,6 +394,18 @@ You conduct thorough research to provide comprehensive information that will inf
 - **searchMicroverse** - Search existing media assets for reference materials
 - **getMicroverseDetails** - Get details about specific media assets
 
+### Framework & Standards Tools (Frontend)
+- **listFrameworks** - Browse existing competency frameworks in the system
+- **getFrameworkDetails** - Get detailed framework info including structure
+- **getFrameworkItems** - Get the criteria/items in a framework
+- **searchASQAUnits** - Search training.gov.au for ASQA competency units
+- **importASQAUnit** - Import an ASQA unit as a framework
+
+### Spreadsheet Framework Upload (Frontend)
+- **uploadFrameworkCSV** - Prompt user to upload a CSV or Excel file (.csv, .xlsx, .xls) containing framework data
+- **analyzeFrameworkCSV** - Analyze file structure and suggest column mappings
+- **createFrameworkFromCSV** - Create framework from uploaded file with specified mappings
+
 ## CRITICAL: Research Limits & Completion
 
 **⚠️ MANDATORY LIMITS - DO NOT EXCEED:**
@@ -572,14 +584,31 @@ Continue researching to fill any gaps or go deeper on key topics.`;
 
   const systemMessage = new SystemMessage({ content: systemContent });
 
-  // Get frontend media tools from CopilotKit state
+  // Get frontend tools from CopilotKit state
   const frontendActions = state.copilotkit?.actions ?? [];
+  
+  // Media tools for searching existing assets
   const mediaTools = frontendActions.filter((action: { name: string }) =>
     ["searchMicroverse", "getMicroverseDetails"].includes(action.name)
   );
+  
+  // Framework tools for checking/importing competency frameworks
+  const frameworkTools = frontendActions.filter((action: { name: string }) =>
+    [
+      "listFrameworks",
+      "getFrameworkDetails",
+      "getFrameworkItems",
+      "searchASQAUnits",
+      "importASQAUnit",
+      // CSV Framework Upload
+      "uploadFrameworkCSV",
+      "analyzeFrameworkCSV",
+      "createFrameworkFromCSV",
+    ].includes(action.name)
+  );
 
-  // Combine backend research tools with frontend media tools
-  const allResearcherTools = [...researcherTools, ...mediaTools];
+  // Combine backend research tools with frontend tools
+  const allResearcherTools = [...researcherTools, ...mediaTools, ...frameworkTools];
 
   // Bind all tools
   const modelWithTools = researcherModel.bindTools(allResearcherTools);

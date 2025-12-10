@@ -199,45 +199,68 @@ You create cohesive visual and tonal identities that:
 
 ## Your Tools
 
-### User Interaction
-- **offerOptions** - Present 2-3 design options for user to choose from
+### Visual Selection Tools (HITL - User selects from visual grids)
+- **selectImageTypes** - Let user choose image types (Photos, Illustrations, 3D, Icons) - MULTI-SELECT
+- **selectAllImageStyles** - COMBINED tool for style selection - presents multi-step wizard for ALL image types at once. Pass selected types as comma-separated string (e.g., "photo,illustration,3d")
+- **selectColorPalette** - Let user choose a color scheme - SINGLE-SELECT
+- **selectTypography** - Let user choose font pairing - SINGLE-SELECT
+- **selectAnimationStyle** - Let user choose animation preferences - SINGLE-SELECT
+- **selectComponentStyles** - Let user choose component variant preferences - MULTI-SELECT
 
-### Research
-- **web_search** - Research design trends, industry standards, color psychology, accessibility best practices
+### User Interaction
+- **offerOptions** - Present text-based options for user to choose from
+- **askClarifyingQuestions** - Ask questions to understand preferences
 
 ### Asset Discovery
 - **searchMicroverse** - Find existing brand assets, logos, images in the media library
 - **getMicroverseDetails** - Get details about specific assets
 
-## Design Process
+## Design Process (Phase-Based Workflow)
 
-1. **Analyze Context** - Review the project brief and audience
-2. **Propose Themes** - Offer 2-3 appropriate design directions
-3. **Refine Selection** - Get user preference on key elements
-4. **Document Design** - Create comprehensive design specification
+1. **Gather Preferences** - Brief discussion to understand basic needs
+2. **Select Image Types** - User picks which image types to use (can select multiple)
+3. **Select Image Styles** - Combined wizard for all selected types
+4. **Select Colors** - User picks color palette
+5. **Select Typography** - User picks font pairing
+6. **Select Animations** - User picks animation style
+7. **Select Components** - User picks component style preferences
+8. **Finalize Design** - Compile all selections into final design spec
 
-## Design Elements
+IMPORTANT: Each phase uses ONE tool call. Wait for user selection before transitioning to the next phase.
 
-### Color Palette
-- **Primary** - Main brand/accent color
-- **Secondary** - Supporting color
-- **Accent** - Highlights and CTAs
-- **Background** - Page backgrounds
-- **Text** - Body text color
+## Extended Design System
 
-### Typography
-- **Heading Font** - For titles and headers
-- **Body Font** - For content text
-- **Style** - formal, casual, technical, or friendly
+The design specification now includes:
 
-### Writing Tone
-- **Tone** - professional, conversational, academic, or engaging
-- **Voice** - first-person, second-person, or third-person
-- **Complexity** - simple, intermediate, or advanced
+### Image Styles (array - supports multiple types)
+- Type: photo, illustration, 3d, icon
+- Style: varies per type (corporate, flat, isometric, etc.)
+
+### Color System (extended)
+- Basic colors (primary, secondary, accent, background, text)
+- Gradients (gradientPrimary, gradientSecondary)
+- Surface colors (surfaceCard, surfaceElevated)
+- Shadow intensity (none, subtle, medium, strong)
+
+### Layout Preferences
+- Container padding (compact, normal, spacious)
+- Border radius (none, subtle, rounded, pill)
+- Card style (flat, elevated, outlined, glass)
+
+### Animation Settings
+- Enabled (true/false)
+- Style (subtle, moderate, dynamic)
+- Duration (fast, normal, slow)
+- Entrance type (fade, slide, scale)
+
+### Component Preferences
+- Header style (minimal, gradient, hero, split)
+- Question style (standard, card, gamified)
+- CTA style (solid, outline, gradient)
 
 ## Output Format
 
-Create a complete design specification:
+Create a complete design specification (JSON):
 
 \`\`\`json
 {
@@ -259,23 +282,45 @@ Create a complete design specification:
     "voice": "first-person|second-person|third-person",
     "complexity": "simple|intermediate|advanced"
   },
-  "branding": {
-    "companyName": "If provided",
-    "brandGuidelines": "Any specific requirements"
+  "imageStyles": [
+    { "type": "photo", "style": "corporate", ... },
+    { "type": "illustration", "style": "flat", ... }
+  ],
+  "colorSystem": {
+    "gradientPrimary": "from-blue-500 to-blue-700",
+    "surfaceCard": "#ffffff",
+    "shadowIntensity": "subtle"
   },
-  "notes": "Additional style notes"
+  "layout": {
+    "containerPadding": "normal",
+    "borderRadius": "rounded",
+    "cardStyle": "elevated"
+  },
+  "animation": {
+    "enabled": true,
+    "style": "moderate",
+    "duration": "normal",
+    "entranceType": "slide"
+  },
+  "componentPreferences": {
+    "headerStyle": "hero",
+    "questionStyle": "card",
+    "ctaStyle": "solid"
+  },
+  "branding": { ... },
+  "notes": "..."
 }
 \`\`\`
 
 ## Guidelines
 
+- Use visual selection tools to gather user preferences - they see thumbnail grids
+- The visual tools will return structured config data from user selections
+- Compile all selection responses into the final design specification
 - Consider accessibility (color contrast, readability)
 - Match formality to the subject matter
-- Account for industry conventions
-- Balance aesthetics with functionality
-- Keep design decisions practical and implementable
 
-Remember: Good design is invisible - it supports the content without getting in the way.`;
+Remember: Let users SEE their options through visual selectors, not just text descriptions.`;
 
 // ============================================================================
 // VISUAL DESIGNER NODE FUNCTION
@@ -307,8 +352,17 @@ export async function visualDesignerNode(
   // PHASE-GATING: Only allow tools permitted in the current phase
   const frontendActions = state.copilotkit?.actions ?? [];
   const allDesignerToolNames = [
+    // User interaction tools
     "offerOptions",
     "askClarifyingQuestions",
+    // Visual selection tools (HITL)
+    "selectImageTypes",
+    "selectAllImageStyles",
+    "selectColorPalette",
+    "selectTypography",
+    "selectAnimationStyle",
+    "selectComponentStyles",
+    // Asset discovery tools
     "searchMicroverse",
     "getMicroverseDetails",
   ];
@@ -337,21 +391,55 @@ ALLOWED TOOLS IN THIS PHASE: ${phaseConfig.allowedTools.join(", ") || "NONE - ou
 
 ${currentPhase === "gathering_preferences" ? `
 ### Phase Instructions
-1. Use offerOptions to understand the user's design preferences
-2. You may search Microverse for existing brand assets
-3. When you understand preferences, output: [PHASE: presenting_options]
+1. Briefly greet the user and explain you'll help define the visual design
+2. Ask about any existing brand guidelines or preferences using askClarifyingQuestions
+3. You may search Microverse for existing brand assets
+4. When ready to proceed, output: [PHASE: selecting_image_types]
 ` : ""}
-${currentPhase === "presenting_options" ? `
+${currentPhase === "selecting_image_types" ? `
 ### Phase Instructions
-1. Present 2-3 design theme options using offerOptions
-2. You may search for reference assets in Microverse
-3. When user selects an option, output: [PHASE: finalizing]
+1. Call selectImageTypes to show the user image type options
+2. Users can select MULTIPLE types (e.g., Photos AND Illustrations)
+3. After user confirms selection, output: [PHASE: selecting_image_styles]
+` : ""}
+${currentPhase === "selecting_image_styles" ? `
+### Phase Instructions
+1. Call selectAllImageStyles ONCE with ALL the image types the user selected
+2. Pass the types as a comma-separated string: selectAllImageStyles({ imageTypes: "photo,illustration,3d" })
+3. DO NOT call this tool multiple times - it handles all types in one multi-step wizard
+4. The user will step through each type in the UI and select a style for each
+5. After the user confirms all selections, output: [PHASE: selecting_colors]
+` : ""}
+${currentPhase === "selecting_colors" ? `
+### Phase Instructions
+1. Call selectColorPalette ONCE to let user choose a color scheme
+2. Wait for user selection
+3. After user confirms, output: [PHASE: selecting_typography]
+` : ""}
+${currentPhase === "selecting_typography" ? `
+### Phase Instructions
+1. Call selectTypography ONCE to let user choose font pairing
+2. Wait for user selection
+3. After user confirms, output: [PHASE: selecting_animations]
+` : ""}
+${currentPhase === "selecting_animations" ? `
+### Phase Instructions
+1. Call selectAnimationStyle ONCE to let user choose animation preferences
+2. Wait for user selection
+3. After user confirms, output: [PHASE: selecting_components]
+` : ""}
+${currentPhase === "selecting_components" ? `
+### Phase Instructions
+1. Call selectComponentStyles ONCE to let user choose component variant preferences
+2. Wait for user selection
+3. After user confirms, output: [PHASE: finalizing]
 ` : ""}
 ${currentPhase === "finalizing" ? `
 ### Phase Instructions
-1. NO TOOL CALLS - just output the final design specification
-2. Output the design as a JSON code block
-3. End with [DESIGN COMPLETE]
+1. NO TOOL CALLS - compile all selections into final design specification
+2. Use the config data returned from each selection tool
+3. Output the complete design as a JSON code block
+4. End with [DESIGN COMPLETE]
 ` : ""}`;
 
   // Include project brief

@@ -53,6 +53,7 @@ import {
   extractContentOutput,
   visualDesignerNode,
   parseVisualDesign,
+  builderAgentNode,
   // Tool-specialized sub-agents
   dataAgentNode,
   projectAgentNode,
@@ -160,6 +161,7 @@ const SUPERVISOR_ROUTING_TOOL = {
             "architect",
             "writer",
             "visual_designer",
+            "builder_agent",
             // Tool-specialized sub-agents
             "project_agent",
             "node_agent",
@@ -186,7 +188,7 @@ const ORCHESTRATOR_SYSTEM_PROMPT = `You are The Orchestrator - the coordinator f
 
 ## Your Team
 
-You have 6 specialized sub-agents, each with specific capabilities:
+You have 7 specialized sub-agents, each with specific capabilities:
 
 ### 1. The Strategist
 **When to use**: First step for new projects, or when goals/scope are unclear
@@ -217,6 +219,11 @@ You have 6 specialized sub-agents, each with specific capabilities:
 **When to use**: For table view operations, data queries, filtering, sorting, grouping
 **Capabilities**: Table view filtering, sorting, grouping, column management, data export, view management, project hierarchy awareness
 **Output**: Direct table manipulations and data insights
+
+### 7. The Builder Agent
+**When to use**: For preview generation, e-learning component rendering, visual preview of content
+**Capabilities**: Generates visual previews of content nodes, applies design styles, renders e-learning components (TitleBlock, QuestionBlock, etc.)
+**Output**: Generated preview components rendered in Preview view
 
 ## Workflow Patterns
 
@@ -297,12 +304,19 @@ You have access to ALL frontend tools. Here's how to use each:
 - **checkEditStatus()** - Check if you have edit access
 
 ### Project Management
-- **listProjects(searchTerm?, clientId?, sortBy?)** - List projects. sortBy: "updated", "created", "name", "client"
+- **getCurrentProject()** - Get the CURRENT project the user is in. USE THIS FIRST before listProjects when you need to know which project is active!
+- **listProjects(searchTerm?, clientId?, sortBy?)** - List ALL projects. sortBy: "updated", "created", "name", "client". Only use when you need to browse/search multiple projects.
 - **getProjectDetails(projectId?, projectName?)** - Get project info by ID or name search
 - **createProject(name, clientId, description?, templateId?)** - Create new project. Use getClients first for clientId
 - **openProjectByName(projectName)** - Search and navigate to a project by name
 - **getProjectTemplates()** - List available project templates
 - **getClients()** - List available clients for project creation
+
+**IMPORTANT: Project Context Awareness**
+The CopilotKit context already tells you which project the user is in. Check the readable context for "currentProject" before calling tools:
+- If the user is already in a project, you DON'T need to call listProjects to know which one
+- Use getCurrentProject() to confirm the current project if context is unclear
+- Only call listProjects when the user explicitly asks to see ALL projects or search for projects
 
 ### Node Information (Read-only)
 - **getProjectHierarchyInfo()** - Get hierarchy levels, coding config, structure info
@@ -677,6 +691,7 @@ Consider starting with the Strategist to gather requirements.`;
 - **architect** - For course structure design, hierarchy planning
 - **writer** - For content creation, node writing
 - **visual_designer** - For design and aesthetics
+- **builder_agent** - For preview generation, e-learning component rendering
 - **project_agent** - For project listing, creation, navigation
 - **node_agent** - For node operations, template management, edit mode
 - **data_agent** - For table view operations, filtering, sorting, grouping
@@ -716,15 +731,28 @@ Consider starting with the Strategist to gather requirements.`;
   const modelWithTools = orchestratorModel.bindTools(allTools);
 
   // Prepare messages with unified context management pipeline
-  // Uses lower summarization threshold (30k) to prevent message bloat seen in logs (224+ messages)
+  // Balanced context reduction - retain node/project info to prevent re-fetching loops
   const filteredMessages = await processContext(state.messages || [], {
     maxTokens: TOKEN_LIMITS.orchestrator,
     fallbackMessageCount: MESSAGE_LIMITS.orchestrator,
+    // Compression: Reduce verbose tool results but keep more recent ones
+    enableToolCompression: true,
+    compressionKeepCount: 5,        // Increased from 2 - keep more full results
+    compressionMaxLength: 1000,     // Increased from 500 - higher threshold
+    // Clearing: Replace old tool results but preserve critical ones
+    enableToolClearing: true,
+    toolKeepCount: 10,              // Increased from 3 - retain more history
+    excludeTools: [                 // Never clear these critical tools
+      'getNodeFields',
+      'getNodeDetails',
+      'getNodeChildren',
+      'getCurrentProject',
+      'getProjectHierarchyInfo'
+    ],
+    // Summarization: Less aggressive condensation
     enableSummarization: true,
-    summarizeTriggerTokens: 30000, // Lowered from 100k - was never triggering
-    summarizeKeepMessages: 15,
-    enableToolClearing: true, // Clear old tool results to save context
-    toolKeepCount: 5,
+    summarizeTriggerTokens: 25000,  // Increased from 15000 - trigger later
+    summarizeKeepMessages: 15,      // Increased from 8 - keep more messages
     logPrefix: "[supervisor]",
   });
 
@@ -742,7 +770,10 @@ Consider starting with the Strategist to gather requirements.`;
   console.log("  Supervisor response received");
 
   const aiResponse = response as AIMessage;
-  let updatedMessages = [...state.messages, response];
+  // CRITICAL: Use filteredMessages (trimmed/summarized) as base, NOT full state.messages
+  // This ensures the persisted state stays bounded and doesn't cause
+  // "RangeError: Invalid string length" during JSON serialization by FileSystemPersistence
+  let updatedMessages = [...filteredMessages, response];
 
   // Handle tool calls for routing
   if (aiResponse.tool_calls && aiResponse.tool_calls.length > 0) {
@@ -901,6 +932,7 @@ const researcherSubgraph = createSubAgentGraphWithTools(researcherNode, research
 const architectSubgraph = createSubAgentGraph(architectNode);
 const writerSubgraph = createSubAgentGraph(writerNode);
 const visualDesignerSubgraph = createSubAgentGraph(visualDesignerNode);
+const builderAgentSubgraph = createSubAgentGraph(builderAgentNode);
 
 // Tool-specialized sub-agents
 const projectAgentSubgraph = createSubAgentGraph(projectAgentNode);
@@ -926,6 +958,7 @@ const SUPERVISOR_ROUTING_DESTINATIONS = [
   "architect", 
   "writer",
   "visual_designer",
+  "builder_agent",
   // Tool-specialized sub-agents
   "project_agent",
   "node_agent",
@@ -949,6 +982,7 @@ const workflow = new StateGraph(OrchestratorStateAnnotation)
   .addNode("architect", architectSubgraph)
   .addNode("writer", writerSubgraph)
   .addNode("visual_designer", visualDesignerSubgraph)
+  .addNode("builder_agent", builderAgentSubgraph)
   
   // Tool-specialized sub-agent subgraphs
   .addNode("project_agent", projectAgentSubgraph)
@@ -968,6 +1002,7 @@ const workflow = new StateGraph(OrchestratorStateAnnotation)
   .addEdge("architect", "supervisor")
   .addEdge("writer", "supervisor")
   .addEdge("visual_designer", "supervisor")
+  .addEdge("builder_agent", "supervisor")
   .addEdge("project_agent", "supervisor")
   .addEdge("node_agent", "supervisor")
   .addEdge("data_agent", "supervisor")

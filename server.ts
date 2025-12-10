@@ -453,6 +453,190 @@ console.log('    POST /api/memory/recall');
 console.log('    POST /api/memory/list');
 
 // ============================================================================
+// IMAGE GENERATION API ENDPOINTS
+// ============================================================================
+
+import Replicate from 'replicate';
+
+// Initialize Replicate client lazily
+let replicateClient: Replicate | null = null;
+
+function getReplicate(): Replicate {
+  if (!replicateClient) {
+    if (!process.env.REPLICATE_API_TOKEN) {
+      throw new Error('REPLICATE_API_TOKEN environment variable not set');
+    }
+    replicateClient = new Replicate({
+      auth: process.env.REPLICATE_API_TOKEN,
+    });
+  }
+  return replicateClient;
+}
+
+// eLearning presets for aspect ratios
+const IMAGE_PRESETS: Record<string, { aspectRatio: string; description: string }> = {
+  banner: { aspectRatio: '21:9', description: 'Course/module banners' },
+  hero: { aspectRatio: '16:9', description: 'Hero images, slides' },
+  content: { aspectRatio: '16:9', description: 'General content images' },
+  thumbnail: { aspectRatio: '3:2', description: 'Card thumbnails' },
+  square: { aspectRatio: '1:1', description: 'Icons, avatars' },
+  portrait: { aspectRatio: '3:4', description: 'Portrait photos' },
+};
+
+/**
+ * POST /api/generate-image
+ * Generate an AI image using Replicate's nano-banana-pro model
+ */
+app.post('/api/generate-image', async (req, res) => {
+  console.log('\n[Image API] Generate request received');
+  
+  try {
+    const { prompt, aspectRatio, outputFormat = 'png', preset } = req.body;
+
+    if (!prompt || typeof prompt !== 'string') {
+      res.status(400).json({ success: false, error: 'Missing or invalid prompt' });
+      return;
+    }
+
+    // Determine aspect ratio from preset or direct value
+    let finalAspectRatio = aspectRatio || '16:9';
+    if (preset && IMAGE_PRESETS[preset]) {
+      finalAspectRatio = IMAGE_PRESETS[preset].aspectRatio;
+    }
+
+    console.log(`  Prompt: "${prompt.substring(0, 80)}..."`);
+    console.log(`  Aspect Ratio: ${finalAspectRatio}`);
+    console.log(`  Preset: ${preset || 'none'}`);
+
+    const replicate = getReplicate();
+
+    // Call Replicate API
+    const output = await replicate.run('google/nano-banana-pro', {
+      input: {
+        prompt,
+        resolution: '2K',
+        image_input: [],
+        aspect_ratio: finalAspectRatio,
+        output_format: outputFormat,
+        safety_filter_level: 'block_only_high',
+      },
+    });
+
+    // Extract URL from output - handle FileOutput object from Replicate
+    let imageUrl: string | null = null;
+    
+    console.log('  [DEBUG] Output type:', typeof output);
+    console.log('  [DEBUG] Output constructor:', output?.constructor?.name);
+    
+    // FileOutput objects have a url() method
+    if (output && typeof output === 'object') {
+      // Try url() method first (FileOutput pattern)
+      if (typeof (output as any).url === 'function') {
+        imageUrl = (output as any).url();
+      }
+      // Try href property
+      else if ('href' in output && typeof (output as any).href === 'string') {
+        imageUrl = (output as any).href;
+      }
+      // Try url property as string
+      else if ('url' in output && typeof (output as any).url === 'string') {
+        imageUrl = (output as any).url;
+      }
+      // Try toString() if it returns a URL
+      else if (typeof output.toString === 'function') {
+        const str = output.toString();
+        if (str.startsWith('http')) {
+          imageUrl = str;
+        }
+      }
+    } else if (typeof output === 'string') {
+      imageUrl = output;
+    } else if (Array.isArray(output) && output.length > 0) {
+      const first = output[0];
+      if (typeof first === 'string') {
+        imageUrl = first;
+      } else if (first && typeof first === 'object') {
+        if (typeof (first as any).url === 'function') {
+          imageUrl = (first as any).url();
+        } else if (typeof (first as any).url === 'string') {
+          imageUrl = (first as any).url;
+        } else if (typeof first.toString === 'function') {
+          const str = first.toString();
+          if (str.startsWith('http')) {
+            imageUrl = str;
+          }
+        }
+      }
+    }
+
+    // Ensure imageUrl is actually a string
+    if (imageUrl && typeof imageUrl !== 'string') {
+      console.log('  [DEBUG] imageUrl is not a string:', typeof imageUrl, imageUrl);
+      imageUrl = String(imageUrl);
+    }
+
+    if (!imageUrl || typeof imageUrl !== 'string') {
+      console.error('  [ERROR] Could not extract URL from output:', output);
+      res.status(500).json({ success: false, error: 'No image URL returned from Replicate' });
+      return;
+    }
+
+    console.log(`  [√] Image generated: ${imageUrl.substring(0, 60)}...`);
+
+    // Download image as buffer
+    const imageResponse = await fetch(imageUrl);
+    if (!imageResponse.ok) {
+      res.status(500).json({ success: false, error: `Failed to download image: ${imageResponse.status}` });
+      return;
+    }
+
+    const arrayBuffer = await imageResponse.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    console.log(`  [√] Downloaded: ${buffer.length} bytes`);
+
+    res.json({
+      success: true,
+      imageBase64: buffer.toString('base64'),
+      url: imageUrl,
+      aspectRatio: finalAspectRatio,
+      outputFormat,
+      prompt,
+      preset: preset || null,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[Image API] Generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Image generation failed',
+    });
+  }
+});
+
+/**
+ * GET /api/image-presets
+ * List available image generation presets
+ */
+app.get('/api/image-presets', (_req, res) => {
+  const presets = Object.entries(IMAGE_PRESETS).map(([name, config]) => ({
+    name,
+    ...config,
+  }));
+
+  res.json({
+    success: true,
+    presets,
+    supportedFormats: ['png', 'jpg'],
+    supportedAspectRatios: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'],
+  });
+});
+
+console.log('[√] Image Generation API endpoints configured');
+console.log('    POST /api/generate-image');
+console.log('    GET  /api/image-presets');
+
+// ============================================================================
 // COPILOTKIT RUNTIME
 // ============================================================================
 

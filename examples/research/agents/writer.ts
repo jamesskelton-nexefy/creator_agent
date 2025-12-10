@@ -5,14 +5,15 @@
  * Works within the structure built by the Architect.
  * Writes engaging, educational training material based on research and design guidelines.
  *
- * Tools (Full CRUD + Navigation + Media):
+ * Tools (Full CRUD + Navigation + Media + Image Generation):
  * - requestEditMode, releaseEditMode - Edit lock management
  * - createNode, getNodeTemplateFields, updateNodeFields, getNodeFields - Content CRUD
  * - getProjectHierarchyInfo, getAvailableTemplates, getNodesByLevel, getNodeDetails - Navigation
  * - searchMicroverse, attachMicroverseToNode - Media integration
+ * - generateAIImage - AI image generation (photos, illustrations, diagrams)
  *
  * Input: Reads courseStructure, researchFindings, visualDesign from state
- * Output: Level 6 content nodes with actual training content
+ * Output: Level 6 content nodes with actual training content and images
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
@@ -87,6 +88,9 @@ The structure should already exist when you start. Your job is to create the act
 - **searchMicroverse** - Find relevant images, videos, assets
 - **attachMicroverseToNode** - Attach media to your content
 
+### Image Generation
+- **generateAIImage** - Generate AI images for content (returns fileId to attach)
+
 ## Content Writing Process
 
 1. **Request Edit Mode** - Always start by requesting edit access
@@ -95,9 +99,68 @@ The structure should already exist when you start. Your job is to create the act
 4. **Get Field Schema** - Use getNodeTemplateFields to know what fields to fill
 5. **Write Content** - Create engaging, educational content
 6. **Create Content Node** - Use createNode with initialFields populated
-7. **Add Media** - Search and attach relevant media if appropriate
+7. **Generate & Attach Images** - Create relevant images and attach to enhance content
 8. **Repeat** - Continue for each content block needed
 9. **Release Edit Mode** - When done writing
+
+## Image Generation Guidelines
+
+When creating content nodes, proactively generate and attach relevant images to enhance learning.
+
+### When to Generate Images
+- **Module/Lesson Headers** - Hero/banner images to set the visual tone
+- **Concept Explanations** - Illustrations to clarify abstract ideas
+- **Process/Procedure Content** - Instructional diagrams showing workflows or steps
+- **Scenario/Example Content** - Contextual photos depicting real-world situations
+- **Safety/Compliance Topics** - Visual reinforcement of important procedures
+
+### Image Types & Prompting Styles
+
+**1. PHOTOGRAPHS** - Realistic images for scenarios, workplace contexts, people
+- Use for: Safety scenarios, workplace examples, customer interactions, equipment
+- Prompt style: "Professional photograph of [subject], [setting], natural lighting, high quality"
+- Example: "Professional photograph of warehouse workers following safety protocols, wearing PPE, well-lit industrial setting"
+
+**2. ILLUSTRATIONS** - Conceptual images for abstract topics, metaphors
+- Use for: Explaining concepts, representing ideas, metaphorical visualizations
+- Prompt style: "Clean modern illustration of [concept], minimalist corporate style, professional colors"
+- Example: "Clean modern illustration of teamwork concept showing diverse professionals collaborating, minimalist flat design"
+
+**3. INSTRUCTIONAL DIAGRAMS** - Flowcharts, process diagrams, step-by-step visuals
+- Use for: Procedures, decision trees, workflows, sequential processes
+- Prompt style: "Clear infographic diagram showing [process], labeled steps, professional design, include text labels: [labels]"
+- Example: "Clear infographic diagram showing 5-step customer complaint resolution process, numbered steps with icons, include text labels: Listen, Acknowledge, Solve, Confirm, Follow-up"
+- Note: Images CAN include text overlays - explicitly specify text in the prompt
+
+### Preset Selection by Content Type
+
+| Content Type | Preset | Aspect Ratio | Use Case |
+|--------------|--------|--------------|----------|
+| Module/Course headers | banner | 21:9 | Wide panoramic banners |
+| Lesson hero images | hero | 16:9 | Full-width hero sections |
+| General content | content | 16:9 | Inline content images |
+| Card/thumbnail previews | thumbnail | 3:2 | Compact card previews |
+| Icons/avatars | square | 1:1 | Small square graphics |
+| Person/character shots | portrait | 3:4 | Vertical people images |
+
+### Image Generation Workflow
+
+1. **Identify Need** - Does this content benefit from a visual? What type?
+2. **Choose Type** - Photo (realistic), Illustration (conceptual), or Diagram (instructional)?
+3. **Select Preset** - Match aspect ratio to content placement (banner, hero, content, etc.)
+4. **Craft Prompt** - Be specific about style, subject, setting, colors, and any text to include
+5. **Generate Image** - Call generateAIImage(prompt, preset, title, description)
+6. **Note the fileId** - The response includes the generated file's ID
+7. **Attach to Node** - Call attachMicroverseToNode(nodeId, fieldKey, fileId)
+
+### Quality Prompting Tips
+
+- Be specific about visual style: "professional", "clean", "modern", "corporate", "friendly"
+- Include context details: setting, lighting conditions, mood, color palette
+- For diagrams, explicitly state any text/labels to include in the image
+- Consider industry context (healthcare = clinical/trustworthy, hospitality = warm/welcoming)
+- Avoid copyrighted characters, logos, or brand names
+- Specify composition when relevant: "centered", "wide shot", "close-up"
 
 ## Writing Guidelines
 
@@ -186,6 +249,8 @@ export async function writerNode(
       // Media integration
       "searchMicroverse",
       "attachMicroverseToNode",
+      // Image generation
+      "generateAIImage",
     ].includes(action.name)
   );
 

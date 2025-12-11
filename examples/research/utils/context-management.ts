@@ -28,15 +28,15 @@ import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 
 /** Default token limits for different agent types */
 export const TOKEN_LIMITS = {
-  orchestrator: 60000,  // Reduced from 100k to encourage earlier trimming
-  subAgent: 30000,      // Reduced from 50k
+  orchestrator: 40000,  // Reduced to prevent state explosion during FileSystemPersistence
+  subAgent: 20000,      // Reduced to keep sub-agent context tight
   summary: 2000,
 } as const;
 
 /** Default message counts for fallback when token counting unavailable */
 export const MESSAGE_LIMITS = {
-  orchestrator: 25,     // Reduced from 40 - keeps context tighter
-  subAgent: 10,         // Reduced from 15
+  orchestrator: 20,     // Reduced aggressively - state persistence limit is 40 messages
+  subAgent: 8,          // Keep sub-agent context minimal
 } as const;
 
 // ============================================================================
@@ -140,6 +140,63 @@ export function stripThinkingBlocks(messages: BaseMessage[]): BaseMessage[] {
   });
 }
 
+/**
+ * Strips tool_use blocks from message content.
+ * CRITICAL: Anthropic API errors occur when both tool_calls property AND tool_use
+ * blocks exist in content with the same IDs. This function removes tool_use from
+ * content when we're relying on the tool_calls property instead.
+ *
+ * @param content - Message content (string or array)
+ * @param toolCallIds - Optional set of tool_call IDs to specifically remove
+ * @returns Content with tool_use blocks removed
+ */
+function stripToolUseFromContent(
+  content: string | any[],
+  toolCallIds?: Set<string>
+): string | any[] {
+  // String content - no tool_use to strip
+  if (typeof content === "string") {
+    return content;
+  }
+
+  // Array content - filter out tool_use blocks
+  if (Array.isArray(content)) {
+    const filtered = content.filter((block) => {
+      if (typeof block === "object" && block !== null && "type" in block) {
+        if (block.type === "tool_use") {
+          // If toolCallIds provided, only remove matching ones
+          if (toolCallIds && block.id) {
+            return !toolCallIds.has(block.id);
+          }
+          // Otherwise remove all tool_use blocks
+          return false;
+        }
+      }
+      return true;
+    });
+
+    // If we filtered everything out, return empty string
+    if (filtered.length === 0) {
+      return "";
+    }
+
+    // If only one text block remains, simplify to string
+    if (filtered.length === 1) {
+      const block = filtered[0];
+      if (typeof block === "string") {
+        return block;
+      }
+      if (typeof block === "object" && block.type === "text" && block.text) {
+        return block.text;
+      }
+    }
+
+    return filtered;
+  }
+
+  return content;
+}
+
 // ============================================================================
 // FILTER ORPHANED TOOL RESULTS
 // ============================================================================
@@ -229,10 +286,17 @@ export function filterOrphanedToolResults(
             if (tc.id) processedToolCallIds.add(tc.id);
           });
 
-          // Always create new AI message with only tool_calls (no content)
-          // This prevents duplicate tool_use IDs when serialized for Anthropic
+          // Get all tool_call IDs (resolved + unresolved) to strip from content
+          const allToolCallIdSet = new Set<string>();
+          aiMsg.tool_calls?.forEach(tc => { if (tc.id) allToolCallIdSet.add(tc.id); });
+
+          // CRITICAL: Strip ALL tool_use blocks from content that match any tool_call
+          // This prevents duplicate tool_use IDs when LangChain serializes tool_calls
+          const strippedContent = stripToolUseFromContent(aiMsg.content, allToolCallIdSet);
+
+          // Always create new AI message with stripped content + tool_calls
           const newAiMsg = new AIMessage({
-            content: "",  // Let LangChain handle content reconstruction from tool_calls
+            content: strippedContent,
             tool_calls: resolvedToolCalls,
             id: aiMsg.id,
             name: aiMsg.name,
@@ -245,7 +309,7 @@ export function filterOrphanedToolResults(
             );
           } else {
             console.log(
-              `  ${prefix}[FILTER] Sanitized AI message with ${resolvedToolCalls.length} tool_calls (cleared content to prevent duplicate tool_use IDs)`
+              `  ${prefix}[FILTER] Sanitized AI message with ${resolvedToolCalls.length} tool_calls (stripped tool_use from content)`
             );
           }
           continue;
@@ -253,9 +317,16 @@ export function filterOrphanedToolResults(
 
         // No resolved tool_calls - if has text content, strip the unresolved tool_calls
         if (hasNonEmptyTextContent(aiMsg)) {
+          // Get IDs to strip from content
+          const unresolvedIdSet = new Set<string>();
+          unresolvedToolCalls.forEach(tc => { if (tc.id) unresolvedIdSet.add(tc.id); });
+          
+          // Strip tool_use blocks from content
+          const strippedContent = stripToolUseFromContent(aiMsg.content, unresolvedIdSet);
+          
           // Create new message without tool_calls to prevent API errors
           const newAiMsg = new AIMessage({
-            content: aiMsg.content,
+            content: strippedContent,
             id: aiMsg.id,
             name: aiMsg.name,
             // Explicitly omit tool_calls since they're all unresolved
@@ -274,6 +345,39 @@ export function filterOrphanedToolResults(
         continue;
       }
 
+      // CRITICAL: ALWAYS strip tool_use blocks from content when there are no tool_calls.
+      // These are orphaned tool_use blocks that will cause "tool_use ids must be unique" errors
+      // if they happen to share IDs with tool_use in other messages.
+      // When there are no tool_calls, tool_use in content serves no purpose anyway.
+      if (Array.isArray(aiMsg.content)) {
+        const hasToolUse = (aiMsg.content as any[]).some(
+          block => typeof block === "object" && block !== null && block.type === "tool_use"
+        );
+        if (hasToolUse) {
+          const strippedContent = stripToolUseFromContent(aiMsg.content);
+          
+          // After stripping, check if there's any content left
+          const hasContentAfterStrip = typeof strippedContent === "string" 
+            ? strippedContent.trim().length > 0
+            : Array.isArray(strippedContent) && strippedContent.length > 0;
+          
+          if (hasContentAfterStrip) {
+            const newAiMsg = new AIMessage({
+              content: strippedContent,
+              id: aiMsg.id,
+              name: aiMsg.name,
+            });
+            filtered.push(newAiMsg);
+            console.log(`  ${prefix}[FILTER] Stripped orphaned tool_use blocks from AI message (no tool_calls)`);
+            continue;
+          } else {
+            // Content was only tool_use blocks with no text - remove entirely
+            console.log(`  ${prefix}[FILTER] Removing AI message with only orphaned tool_use blocks`);
+            continue;
+          }
+        }
+      }
+      
       // Filter AI messages with empty text content (only thinking blocks)
       if (!hasNonEmptyTextContent(aiMsg)) {
         console.log(
@@ -281,6 +385,7 @@ export function filterOrphanedToolResults(
         );
         continue;
       }
+      
       filtered.push(msg);
       continue;
     }
@@ -387,16 +492,41 @@ export function repairDanglingToolCalls(
     if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
       const aiMsg = msg as AIMessage;
 
+      // Collect all tool calls from BOTH sources:
+      // 1. The tool_calls property (standard LangChain format)
+      // 2. The content array (may contain tool_use blocks from Claude)
+      const allToolCalls: Array<{ id: string; name: string }> = [];
+
+      // Check tool_calls property
       if (aiMsg.tool_calls?.length) {
+        for (const tc of aiMsg.tool_calls) {
+          if (tc.id) {
+            allToolCalls.push({ id: tc.id, name: tc.name });
+          }
+        }
+      }
+
+      // Also check content array for tool_use blocks (Claude's native format)
+      // These might exist even if tool_calls is empty
+      if (Array.isArray(aiMsg.content)) {
+        for (const block of aiMsg.content as any[]) {
+          if (typeof block === "object" && block !== null && block.type === "tool_use" && block.id) {
+            // Only add if not already in allToolCalls
+            if (!allToolCalls.some(tc => tc.id === block.id)) {
+              allToolCalls.push({ id: block.id, name: block.name || "unknown_tool" });
+            }
+          }
+        }
+      }
+
+      if (allToolCalls.length > 0) {
         // Find tool_calls without corresponding results
-        const danglingToolCalls = aiMsg.tool_calls.filter(
-          (tc) => tc.id && !toolResultIds.has(tc.id)
+        const danglingToolCalls = allToolCalls.filter(
+          (tc) => !toolResultIds.has(tc.id)
         );
 
         // Create synthetic ToolMessage for each dangling call
         for (const toolCall of danglingToolCalls) {
-          if (!toolCall.id) continue;
-
           const syntheticResult = new ToolMessage({
             content: `[Tool call cancelled or interrupted - no result available]`,
             tool_call_id: toolCall.id,
@@ -439,6 +569,10 @@ export interface TrimMessagesOptions {
   endOn?: ("human" | "ai" | "tool")[];
   /** Log prefix for debugging */
   logPrefix?: string;
+  /** Original user request to preserve (from activeTask) */
+  originalRequest?: string;
+  /** Keywords that indicate task-critical messages to preserve */
+  preserveKeywords?: string[];
 }
 
 /**
@@ -448,6 +582,7 @@ export interface TrimMessagesOptions {
  * Preserves:
  * - System messages (always kept at start)
  * - Tool use/result pairs (never breaks them apart)
+ * - Task-critical messages (containing original user request or keywords)
  * - Recent context based on token or message count
  *
  * @param messages - Messages to trim
@@ -466,9 +601,31 @@ export async function trimMessages(
     startOn = "human",
     endOn = ["human", "tool"],
     logPrefix = "",
+    originalRequest,
+    preserveKeywords = [],
   } = options;
 
   const prefix = logPrefix ? `${logPrefix} ` : "";
+
+  // Helper: check if a message is task-critical and should be preserved
+  const isTaskCritical = (msg: BaseMessage): boolean => {
+    const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+    
+    // Check if this message contains the original user request
+    if (originalRequest && content.includes(originalRequest.substring(0, 100))) {
+      return true;
+    }
+    
+    // Check for preserve keywords
+    const contentLower = content.toLowerCase();
+    for (const keyword of preserveKeywords) {
+      if (contentLower.includes(keyword.toLowerCase())) {
+        return true;
+      }
+    }
+    
+    return false;
+  };
 
   // If we have a model, use token-based trimming
   if (model) {
@@ -503,6 +660,18 @@ export async function trimMessages(
     const msgType = getMessageType(m);
     return msgType !== "system" && msgType !== "SystemMessage";
   });
+
+  // Identify task-critical messages that should be preserved
+  const taskCriticalIndices = new Set<number>();
+  otherMessages.forEach((msg, idx) => {
+    if (isTaskCritical(msg)) {
+      taskCriticalIndices.add(idx);
+    }
+  });
+
+  if (taskCriticalIndices.size > 0) {
+    console.log(`  ${prefix}[TRIM] Found ${taskCriticalIndices.size} task-critical messages to preserve`);
+  }
 
   // Find a safe cut point that doesn't break tool_use/tool_result pairs
   let startIdx = Math.max(0, otherMessages.length - fallbackMessageCount);
@@ -543,13 +712,32 @@ export async function trimMessages(
     startIdx = Math.max(0, otherMessages.length - fallbackMessageCount);
   }
 
-  const recentMessages = otherMessages.slice(startIdx);
+  // Build result, preserving task-critical messages even if they're before startIdx
+  const recentMessages: BaseMessage[] = [];
+  const preservedFromOlderMessages: BaseMessage[] = [];
+
+  for (let i = 0; i < otherMessages.length; i++) {
+    const msg = otherMessages[i];
+    
+    if (i >= startIdx) {
+      // Recent messages - always include
+      recentMessages.push(msg);
+    } else if (taskCriticalIndices.has(i)) {
+      // Older but task-critical - preserve
+      preservedFromOlderMessages.push(msg);
+    }
+  }
+
+  // Combine: system messages + preserved older task-critical + recent
+  // NOTE: We don't add separator messages because:
+  // 1. SystemMessage would cause "System messages are only permitted as the first passed message" error
+  // 2. HumanMessage would break turn-taking patterns and create orphaned messages
+  // The preserved messages are self-explanatory, and agents have task context injection
+  const result: BaseMessage[] = [...systemMessages, ...preservedFromOlderMessages, ...recentMessages];
 
   console.log(
-    `  ${prefix}[TRIM] Messages: ${messages.length} -> ${systemMessages.length + recentMessages.length}`
+    `  ${prefix}[TRIM] Messages: ${messages.length} -> ${result.length} (${preservedFromOlderMessages.length} task-critical preserved)`
   );
-
-  const result = [...systemMessages, ...recentMessages];
 
   // Final safety check: never return empty array if we had messages
   if (result.length === 0 && messages.length > 0) {
@@ -1177,6 +1365,10 @@ export interface ProcessContextOptions {
   compressionMaxLength?: number;
   /** Log prefix */
   logPrefix?: string;
+  /** Original user request to preserve (from activeTask) - messages containing this will be kept */
+  originalRequest?: string;
+  /** Keywords that indicate task-critical messages to preserve during trimming */
+  preserveKeywords?: string[];
 }
 
 /**
@@ -1219,6 +1411,8 @@ export async function processContext(
     compressionKeepCount = 2,
     compressionMaxLength = 1000,
     logPrefix = "",
+    originalRequest,
+    preserveKeywords = [],
   } = options;
 
   let processed = messages;
@@ -1261,12 +1455,14 @@ export async function processContext(
     });
   }
 
-  // Step 6: Trim to limit
+  // Step 6: Trim to limit with task-critical message preservation
   processed = await trimMessages(processed, {
     maxTokens,
     model,
     fallbackMessageCount,
     logPrefix,
+    originalRequest,
+    preserveKeywords,
   });
 
   // Step 7: Filter orphaned tool results AGAIN (post-trim)

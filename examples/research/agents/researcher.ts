@@ -20,8 +20,8 @@ import { ChatAnthropic } from "@langchain/anthropic";
 import { z } from "zod";
 import OpenAI from "openai";
 import { createDocumentService, DocumentService } from "../lib/documents";
-import type { OrchestratorState, ResearchBrief } from "../state/agent-state";
-import { getCondensedBrief } from "../state/agent-state";
+import type { OrchestratorState, ResearchBrief, ActiveTask } from "../state/agent-state";
+import { getCondensedBrief, generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
@@ -530,6 +530,12 @@ export async function researcherNode(
   // Build context-aware system message
   let systemContent = RESEARCHER_SYSTEM_PROMPT;
 
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
+
   // Count previous web_search calls in the conversation
   const messages = state.messages || [];
   let webSearchCount = 0;
@@ -708,6 +714,25 @@ The user is waiting for research results.`,
     }
   }
 
+  // Build progress update for activeTask
+  const progressUpdates: string[] = [];
+  if (isResearchComplete && parsedFindings) {
+    const topicCount = parsedFindings.keyTopics?.length || 0;
+    const citationCount = parsedFindings.citations?.length || 0;
+    progressUpdates.push(`Researcher: Completed research with ${topicCount} key topics and ${citationCount} citations`);
+  } else if (currentIteration > 1) {
+    progressUpdates.push(`Researcher: Iteration ${currentIteration} - gathering information`);
+  }
+
+  // Update activeTask with progress if there are updates
+  const activeTaskUpdate: Partial<ActiveTask> | null = progressUpdates.length > 0
+    ? {
+        progress: progressUpdates,
+        // Clear assignment when work is complete
+        ...(isResearchComplete && { assignedAgent: "orchestrator" as const }),
+      }
+    : null;
+
   return {
     messages: [response],
     currentAgent: "researcher",
@@ -718,6 +743,8 @@ The user is waiting for research results.`,
     researchIterationCount: isResearchComplete ? 0 : currentIteration,
     // Include parsed research findings if available
     ...(parsedFindings && { researchFindings: parsedFindings }),
+    // Update activeTask with progress (reducer will merge with existing progress)
+    ...(activeTaskUpdate && { activeTask: activeTaskUpdate as ActiveTask }),
   };
 }
 

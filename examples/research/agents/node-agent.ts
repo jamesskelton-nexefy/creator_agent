@@ -20,6 +20,7 @@ import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { OrchestratorState } from "../state/agent-state";
+import { generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
@@ -164,6 +165,12 @@ export async function nodeAgentNode(
 
   // Build context-aware system message
   let systemContent = NODE_AGENT_SYSTEM_PROMPT;
+
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
 
   // If we have project context, add it
   if (state.projectBrief) {

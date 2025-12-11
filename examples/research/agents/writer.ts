@@ -1,30 +1,32 @@
 /**
  * Writer Agent
  *
- * Creates the ACTUAL CONTENT for training courses (Level 6 content blocks).
- * Works within the structure built by the Architect.
+ * FILLS IN the actual content for training courses within the structure built by the Architect.
+ * The Architect creates the skeleton (including Content Block nodes), the Writer fills in content.
  * Writes engaging, educational training material based on research and design guidelines.
  *
  * Tools (Full CRUD + Navigation + Media + Image Generation):
  * - requestEditMode, releaseEditMode - Edit lock management
+ * - batchUpdateNodeFields - **PREFERRED** - Update multiple Content Blocks at once (max 10)
  * - createNode, getNodeTemplateFields, updateNodeFields, getNodeFields - Content CRUD
  * - getProjectHierarchyInfo, getAvailableTemplates, getNodesByLevel, getNodeDetails - Navigation
  * - searchMicroverse, attachMicroverseToNode - Media integration
  * - generateAIImage - AI image generation (photos, illustrations, diagrams)
  *
  * Input: Reads courseStructure, researchFindings, visualDesign from state
- * Output: Level 6 content nodes with actual training content and images
+ * Output: Populated Content Block nodes with actual training content and images
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, ContentOutput, PlannedNode } from "../state/agent-state";
-import { getCondensedBrief, getCondensedResearch } from "../state/agent-state";
+import type { OrchestratorState, ContentOutput, PlannedNode, ActiveTask, WriterProgress } from "../state/agent-state";
+import { getCondensedBrief, getCondensedResearch, generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
   filterOrphanedToolResults,
+  repairDanglingToolCalls,
   hasUsableResponse,
 } from "../utils";
 
@@ -46,12 +48,13 @@ const writerModel = new ChatAnthropic({
 // SYSTEM PROMPT
 // ============================================================================
 
-const WRITER_SYSTEM_PROMPT = `You are The Writer - you CREATE the actual training content that learners interact with.
+const WRITER_SYSTEM_PROMPT = `You are The Writer - you FILL IN the actual training content that learners interact with.
 
 ## Your Role
 
-You work within the structure built by the Architect and create Level 6 content blocks - the actual training material. Your content:
+You work within the COMPLETE structure built by the Architect and populate Content Blocks with actual training material. The Architect creates ALL nodes including empty Content Block shells - you fill them with content.
 
+Your content:
 1. **Engages** - Captures and maintains learner attention
 2. **Educates** - Clearly explains concepts and procedures  
 3. **Applies** - Connects theory to practical application
@@ -60,29 +63,37 @@ You work within the structure built by the Architect and create Level 6 content 
 
 ## What You Do vs The Architect
 
-- **Architect** builds the skeleton: modules, lessons, topics (Levels 2-5)
-- **You** fill in the content: content blocks, activities, assessments (Level 6)
+- **Architect** builds the COMPLETE skeleton: Sections, Topics, Sub-Topics, Content Groups, AND Content Blocks (L2-L6)
+- **You** fill in the CONTENT: Populate the existing Content Block nodes with actual text, examples, media
 
-The structure should already exist when you start. Your job is to create the actual training content within that structure.
+The complete structure (including Content Block nodes) should already exist when you start. Your job is to:
+1. **CALL getNodeTreeSnapshot FIRST** to get a complete picture of all nodes and which Content Blocks need content
+2. Update their content fields using batchUpdateNodeFields (preferred) or updateNodeFields
+3. Generate and attach images to enhance learning
+4. Create additional Content Blocks ONLY if needed for the content
 
 ## Your Tools
+
+### CRITICAL: Start Here - Get Full Picture in ONE Call
+- **getNodeTreeSnapshot** - **CALL THIS FIRST!** Returns ALL nodes with their content status in a single call. Shows exactly which Content Blocks need content. Eliminates the need for multiple getNodesByLevel/getNodeChildren calls.
 
 ### Edit Mode (REQUIRED)
 - **requestEditMode** - Request edit lock before making changes
 - **releaseEditMode** - Release edit lock when done
 
-### Content Creation
-- **createNode** - Create Level 6 content blocks
-- **getNodeTemplateFields** - Get field schema to understand what to write
-- **updateNodeFields** - Update content in existing nodes
-- **getNodeFields** - Read current content from nodes
+### Content Creation & Editing
+- **batchUpdateNodeFields** - **PREFERRED FOR MULTIPLE NODES** - Update up to 10 Content Blocks at once. Nodes with existing content are automatically skipped.
+- **updateNodeFields** - Update content in a single Content Block node
+- **getNodeFields** - Read current content from nodes before updating
+- **getNodeTemplateFields** - Get field schema to understand what fields to write
+- **createNode** - Create additional Content Blocks ONLY if structure is incomplete
 
-### Navigation (Find where to add content)
-- **getProjectHierarchyInfo** - Understand hierarchy levels
-- **getAvailableTemplates** - See what content templates exist
-- **getNodesByLevel** - Find parent nodes to add content under
-- **getNodeDetails** - Get detailed info about a node
-- **getNodeChildren** - See what content already exists
+### Navigation (Use only if you need more detail after snapshot)
+- **getProjectHierarchyInfo** - Understand hierarchy levels (usually not needed after snapshot)
+- **getNodesByLevel** - Find nodes at a specific level (use snapshot instead)
+- **getNodeChildren** - Check children of specific node
+- **getNodeDetails** - Get detailed info about a specific node
+- **getAvailableTemplates** - See what templates exist (rarely needed)
 
 ### Media Integration
 - **searchMicroverse** - Find relevant images, videos, assets
@@ -93,15 +104,51 @@ The structure should already exist when you start. Your job is to create the act
 
 ## Content Writing Process
 
+### RECOMMENDED: Start with Snapshot (Saves Multiple Tool Calls)
+1. **Get Full Picture** - Call getNodeTreeSnapshot() FIRST to see ALL nodes and which Content Blocks need content
+2. **Request Edit Mode** - Call requestEditMode() to get edit access
+3. **Get Field Schema** - Use getNodeTemplateFields() to understand the field structure (once per template)
+4. **Prepare Content** - Write content for Content Blocks listed in contentBlocksNeedingContent
+5. **Batch Update** - Use batchUpdateNodeFields() with up to 10 nodes at a time
+6. **Generate & Attach Images** - Create relevant images and attach to enhance content
+7. **Release Edit Mode** - When done writing
+
+### Single Node Update (1-2 nodes)
 1. **Request Edit Mode** - Always start by requesting edit access
-2. **Navigate Structure** - Use getNodesByLevel to find where to add content
-3. **Check Templates** - Use getAvailableTemplates to see Level 6 content types
-4. **Get Field Schema** - Use getNodeTemplateFields to know what fields to fill
-5. **Write Content** - Create engaging, educational content
-6. **Create Content Node** - Use createNode with initialFields populated
+2. **Discover Content Blocks** - Either use snapshot (preferred) or getNodesByLevel() to find Content Blocks
+3. **Read Existing Node** - Use getNodeFields() to see what fields exist and current content
+4. **Get Field Schema** - Use getNodeTemplateFields() to understand what fields to populate
+5. **Write Content** - Create engaging, educational content for the topic
+6. **Update Content Block** - Use updateNodeFields() to populate the existing node with content
 7. **Generate & Attach Images** - Create relevant images and attach to enhance content
-8. **Repeat** - Continue for each content block needed
+8. **Repeat** - Continue for each Content Block that needs content
 9. **Release Edit Mode** - When done writing
+
+### Batch Update (3+ nodes) - PREFERRED
+1. **Get Full Picture** - Call getNodeTreeSnapshot() to see all Content Blocks needing content
+2. **Request Edit Mode** - Always start by requesting edit access
+3. **Get Field Schema** - Use getNodeTemplateFields() to understand the field structure
+4. **Prepare Content** - Write content for multiple nodes
+5. **Batch Update** - Use batchUpdateNodeFields() with up to 10 nodes at a time:
+   \`\`\`
+   batchUpdateNodeFields({
+     updates: [
+       { nodeId: "uuid-1", fieldUpdates: { "assignment-id": "content text..." } },
+       { nodeId: "uuid-2", fieldUpdates: { "assignment-id": "content text..." } },
+       // ... up to 10 nodes per batch
+     ]
+   })
+   \`\`\`
+6. **Check Results** - Review which nodes were updated/skipped
+7. **Continue** - Process next batch of 10 until all Content Blocks have content
+8. **Generate Images** - Create and attach images to enhance content
+9. **Release Edit Mode** - When done writing
+
+### Duplication Prevention
+- Nodes with existing primary content are automatically SKIPPED (not overwritten)
+- If >50% of a batch already has content, the batch is BLOCKED with guidance
+- You can safely retry batches - already-written nodes will be skipped
+- Check the response for skipped nodes to understand what's already complete
 
 ## Image Generation Guidelines
 
@@ -200,13 +247,20 @@ When creating content nodes, proactively generate and attach relevant images to 
 
 ## Guidelines
 
-- Create content nodes ONE AT A TIME - wait for success
-- Find the parent node FIRST before creating under it
-- Fill in ALL relevant fields when creating
-- Match content to the learning objectives
+- Work on Content Blocks ONE AT A TIME - wait for success before proceeding
+- Use getNodesByLevel() to find all Content Blocks that need content
+- Use updateNodeFields() to populate existing Content Blocks (preferred over createNode)
+- Read existing node content with getNodeFields() before updating
+- Fill in ALL relevant content fields (text, descriptions, etc.)
+- Match content to the learning objectives in the project brief
 - Keep content scannable with headers and bullets
 - Use concrete examples over abstract theory
-- Consider adding media to enhance engagement
+- Generate and attach images to enhance engagement
+
+## Division of Responsibility
+
+**Architect creates**: The complete skeleton from L2 to Content Blocks (empty shells)
+**You fill in**: The actual content text, examples, media within those Content Blocks
 
 Remember: Great content transforms learners. Every word should serve the learning experience.`;
 
@@ -217,6 +271,9 @@ Remember: Great content transforms learners. Every word should serve the learnin
 /**
  * The Writer agent node.
  * Creates content nodes based on the course structure.
+ * 
+ * Uses dedicated writerMessages channel to maintain conversation context
+ * across orchestrator round-trips, preventing context loss from message trimming.
  */
 export async function writerNode(
   state: OrchestratorState,
@@ -226,21 +283,26 @@ export async function writerNode(
   console.log("  Course structure available:", state.courseStructure ? "yes" : "no");
   console.log("  Nodes written so far:", state.writtenContent?.length || 0);
   console.log("  Nodes created in session:", state.createdNodes?.length || 0);
+  console.log("  Writer messages in channel:", state.writerMessages?.length || 0);
+  console.log("  Writer progress:", state.writerProgress?.workflow || "none");
 
   // Get frontend tools from CopilotKit state
   // The writer uses CRUD for content + navigation to find structure + media tools
   const frontendActions = state.copilotkit?.actions ?? [];
   const writerTools = frontendActions.filter((action: { name: string }) =>
     [
+      // SNAPSHOT - Get full picture in ONE call (use FIRST!)
+      "getNodeTreeSnapshot",
       // Edit mode management
       "requestEditMode",
       "releaseEditMode",
-      // Content CRUD
+      // Content CRUD - batchUpdateNodeFields preferred for multiple nodes
+      "batchUpdateNodeFields",
       "createNode",
       "getNodeTemplateFields",
       "updateNodeFields",
       "getNodeFields",
-      // Navigation (find where to add content)
+      // Navigation (use after snapshot if needed)
       "getProjectHierarchyInfo",
       "getAvailableTemplates",
       "getNodesByLevel",
@@ -258,6 +320,33 @@ export async function writerNode(
 
   // Build context-aware system message
   let systemContent = WRITER_SYSTEM_PROMPT;
+
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
+
+  // Add writer progress context (critical for maintaining continuity)
+  if (state.writerProgress) {
+    systemContent += `\n\n## Your Previous Progress (DO NOT REPEAT THESE STEPS)
+
+**Current Workflow Phase**: ${state.writerProgress.workflow}
+**Current Working Parent**: ${state.writerProgress.currentParentId || "Not set"}
+**Nodes Already Explored**: ${state.writerProgress.exploredNodes.length > 0 
+  ? state.writerProgress.exploredNodes.slice(-10).join(", ") 
+  : "None yet"}
+
+**Recent Actions Taken**:
+${state.writerProgress.toolCallSummary.slice(-10).map(s => `- ${s}`).join("\n") || "No actions recorded yet"}
+
+${state.writerProgress.hierarchyCache ? `**Cached Hierarchy Info**:
+- Levels: ${state.writerProgress.hierarchyCache.levelNames.join(" > ")}
+- Max Depth: ${state.writerProgress.hierarchyCache.maxDepth}
+- Content Level: ${state.writerProgress.hierarchyCache.contentLevel}` : ""}
+
+**IMPORTANT**: You already have context from previous invocations. Continue from where you left off - do NOT re-explore structure you've already discovered.`;
+  }
 
   // Include project brief for context
   if (state.projectBrief) {
@@ -316,15 +405,32 @@ ${state.createdNodes.map((n) => `- "${n.title}" (ID: ${n.nodeId.substring(0, 8)}
     ? writerModel.bindTools(writerTools)
     : writerModel;
 
-  // Filter messages for this agent's context - filter orphans first, then slice
-  // Filter AFTER slicing - slicing can create new orphans by removing AI messages with tool_use
-  const slicedMessages = (state.messages || []).slice(-10);
-  const recentMessages = filterOrphanedToolResults(slicedMessages, "[writer]");
+  // USE WRITER-SPECIFIC MESSAGE CHANNEL
+  // This is the key change - read from writerMessages instead of slicing state.messages
+  // This preserves the writer's conversation history across orchestrator round-trips
+  // Force recompile: 2025-12-11
+  let writerConversation: BaseMessage[] = [];
+  
+  if (state.writerMessages && state.writerMessages.length > 0) {
+    // Use writer's own message channel (already filtered and maintained)
+    // CRITICAL: Must call both filterOrphanedToolResults AND repairDanglingToolCalls
+    // to ensure proper tool_use/tool_result pairing for Claude API
+    let filtered = filterOrphanedToolResults(state.writerMessages, "[writer]");
+    writerConversation = repairDanglingToolCalls(filtered, "[writer]");
+    console.log(`  Using ${writerConversation.length} messages from writerMessages channel`);
+  } else {
+    // First invocation or fresh start - use recent messages from main channel
+    // CRITICAL: Must call both filterOrphanedToolResults AND repairDanglingToolCalls
+    const slicedMessages = (state.messages || []).slice(-10);
+    let filtered = filterOrphanedToolResults(slicedMessages, "[writer]");
+    writerConversation = repairDanglingToolCalls(filtered, "[writer]");
+    console.log(`  First invocation - using ${writerConversation.length} messages from main channel`);
+  }
 
   console.log("  Invoking writer model...");
 
   let response = await modelWithTools.invoke(
-    [systemMessage, ...recentMessages],
+    [systemMessage, ...writerConversation],
     config
   );
 
@@ -351,7 +457,7 @@ The user is waiting for you to write content.`,
 
     console.log("  [RETRY] Re-invoking with nudge...");
     response = await modelWithTools.invoke(
-      [systemMessage, ...recentMessages, nudgeMessage],
+      [systemMessage, ...writerConversation, nudgeMessage],
       config
     );
     
@@ -367,12 +473,102 @@ The user is waiting for you to write content.`,
     }
   }
 
+  // Build progress update for activeTask based on tool calls made
+  const progressUpdates: string[] = [];
+  const toolCallSummaries: string[] = [];
+  const toolCalls = aiResponse.tool_calls || [];
+  
+  const createNodeCalls = toolCalls.filter(tc => tc.name === "createNode");
+  const updateNodeCalls = toolCalls.filter(tc => tc.name === "updateNodeFields");
+  const batchUpdateCalls = toolCalls.filter(tc => tc.name === "batchUpdateNodeFields");
+  const imageGenCalls = toolCalls.filter(tc => tc.name === "generateAIImage");
+  const navigationCalls = toolCalls.filter(tc => 
+    ["getNodesByLevel", "getNodeChildren", "getNodeDetails", "getAvailableTemplates", "getProjectHierarchyInfo"].includes(tc.name)
+  );
+  
+  if (createNodeCalls.length > 0) {
+    progressUpdates.push(`Writer: Creating ${createNodeCalls.length} content node(s)`);
+    for (const tc of createNodeCalls) {
+      toolCallSummaries.push(`Created node: ${tc.args?.title || "untitled"}`);
+    }
+  }
+  if (batchUpdateCalls.length > 0) {
+    // Extract count of nodes being batch updated
+    const batchCount = batchUpdateCalls.reduce((acc, tc) => {
+      const updates = tc.args?.updates;
+      return acc + (Array.isArray(updates) ? updates.length : 0);
+    }, 0);
+    progressUpdates.push(`Writer: Batch updating ${batchCount} node(s)`);
+    toolCallSummaries.push(`Batch updated ${batchCount} node field(s)`);
+  }
+  if (updateNodeCalls.length > 0) {
+    progressUpdates.push(`Writer: Updating ${updateNodeCalls.length} node field(s)`);
+    toolCallSummaries.push(`Updated ${updateNodeCalls.length} node field(s)`);
+  }
+  if (imageGenCalls.length > 0) {
+    progressUpdates.push(`Writer: Generating ${imageGenCalls.length} AI image(s)`);
+    toolCallSummaries.push(`Generated ${imageGenCalls.length} AI image(s)`);
+  }
+  if (navigationCalls.length > 0) {
+    for (const tc of navigationCalls) {
+      toolCallSummaries.push(`Called ${tc.name}${tc.args?.nodeId ? ` on ${tc.args.nodeId.substring(0, 8)}...` : ""}`);
+    }
+  }
+
+  // Extract explored node IDs from navigation tool calls and batch updates
+  const exploredNodeIds: string[] = [];
+  for (const tc of toolCalls) {
+    if (tc.args?.nodeId && typeof tc.args.nodeId === "string") {
+      exploredNodeIds.push(tc.args.nodeId);
+    }
+    if (tc.args?.parentNodeId && typeof tc.args.parentNodeId === "string") {
+      exploredNodeIds.push(tc.args.parentNodeId);
+    }
+    // Extract node IDs from batch updates
+    if (tc.name === "batchUpdateNodeFields" && Array.isArray(tc.args?.updates)) {
+      for (const update of tc.args.updates) {
+        if (update.nodeId && typeof update.nodeId === "string") {
+          exploredNodeIds.push(update.nodeId);
+        }
+      }
+    }
+  }
+
+  // Determine workflow phase based on tool calls
+  let workflowPhase: WriterProgress["workflow"] = state.writerProgress?.workflow || "exploring";
+  if (createNodeCalls.length > 0 || updateNodeCalls.length > 0 || batchUpdateCalls.length > 0) {
+    workflowPhase = "creating";
+  } else if (navigationCalls.length > 0) {
+    workflowPhase = "exploring";
+  }
+
+  // Build writerProgress update
+  const writerProgressUpdate: WriterProgress = {
+    exploredNodes: exploredNodeIds,
+    currentParentId: state.writerProgress?.currentParentId || null,
+    workflow: workflowPhase,
+    toolCallSummary: toolCallSummaries,
+    hierarchyCache: state.writerProgress?.hierarchyCache,
+    lastUpdated: new Date().toISOString(),
+  };
+
+  // Update activeTask with progress if there are updates
+  const activeTaskUpdate: Partial<ActiveTask> | null = progressUpdates.length > 0
+    ? { progress: progressUpdates }
+    : null;
+
   return {
     messages: [response],
     currentAgent: "writer",
     agentHistory: ["writer"],
     // Clear routing decision when this agent starts - prevents stale routing
     routingDecision: null,
+    // Update activeTask with progress (reducer will merge with existing progress)
+    ...(activeTaskUpdate && { activeTask: activeTaskUpdate as ActiveTask }),
+    // CRITICAL: Append to writer's own message channel for continuity
+    writerMessages: [response],
+    // Update writer progress state for semantic context
+    writerProgress: writerProgressUpdate,
   };
 }
 

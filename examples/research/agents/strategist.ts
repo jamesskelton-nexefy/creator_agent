@@ -20,8 +20,8 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, ProjectBrief, AgentWorkState, StrategistPhase } from "../state/agent-state";
-import { STRATEGIST_PHASES } from "../state/agent-state";
+import type { OrchestratorState, ProjectBrief, AgentWorkState, StrategistPhase, ActiveTask } from "../state/agent-state";
+import { STRATEGIST_PHASES, generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
@@ -270,6 +270,12 @@ export async function strategistNode(
   // Build context-aware system message
   let systemContent = STRATEGIST_SYSTEM_PROMPT;
   
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
+  
   // Add phase-specific instructions
   systemContent += `\n\n## CURRENT PHASE: ${currentPhase.toUpperCase()}
 
@@ -490,6 +496,27 @@ The user is waiting for your response.`,
     };
   }
 
+  // Build progress update for activeTask
+  const progressUpdates: string[] = [];
+  if (nextPhase === "searching_references") {
+    progressUpdates.push("Strategist: Completed requirements gathering phase");
+  }
+  if (nextPhase === "creating_brief") {
+    progressUpdates.push("Strategist: Completed framework/reference search");
+  }
+  if (isBriefComplete && parsedBrief) {
+    progressUpdates.push(`Strategist: Created project brief for "${parsedBrief.purpose.substring(0, 50)}..."`);
+  }
+
+  // Update activeTask with progress if there are updates
+  const activeTaskUpdate: Partial<ActiveTask> | null = progressUpdates.length > 0
+    ? {
+        progress: progressUpdates,
+        // Clear assignment when work is complete
+        ...(isBriefComplete && { assignedAgent: "orchestrator" as const }),
+      }
+    : null;
+
   return {
     messages: [response],
     currentAgent: "strategist",
@@ -500,6 +527,8 @@ The user is waiting for your response.`,
     ...(parsedBrief && { projectBrief: parsedBrief }),
     // Update work state based on phase/HITL analysis
     awaitingUserAction: newWorkState,
+    // Update activeTask with progress (reducer will merge with existing progress)
+    ...(activeTaskUpdate && { activeTask: activeTaskUpdate as ActiveTask }),
   };
 }
 

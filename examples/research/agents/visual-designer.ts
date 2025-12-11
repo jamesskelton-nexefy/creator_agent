@@ -18,8 +18,8 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, VisualDesign, AgentWorkState, VisualDesignerPhase } from "../state/agent-state";
-import { getCondensedBrief, VISUAL_DESIGNER_PHASES } from "../state/agent-state";
+import type { OrchestratorState, VisualDesign, AgentWorkState, VisualDesignerPhase, ActiveTask } from "../state/agent-state";
+import { getCondensedBrief, VISUAL_DESIGNER_PHASES, generateTaskContext } from "../state/agent-state";
 import { researcherTools } from "./researcher";
 
 // Centralized context management utilities
@@ -382,6 +382,12 @@ export async function visualDesignerNode(
   // Build context-aware system message
   let systemContent = DESIGNER_SYSTEM_PROMPT;
   
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
+  
   // Add phase-specific instructions
   systemContent += `\n\n## CURRENT PHASE: ${currentPhase.toUpperCase()}
 
@@ -634,6 +640,26 @@ The user is waiting for design options.`,
     };
   }
 
+  // Build progress update for activeTask
+  const progressUpdates: string[] = [];
+  if (nextPhase === "presenting_options") {
+    progressUpdates.push("Visual Designer: Completed design research phase");
+  }
+  if (nextPhase === "creating_spec") {
+    progressUpdates.push("Visual Designer: User selected design options");
+  }
+  if (isDesignComplete && parsedDesign) {
+    progressUpdates.push(`Visual Designer: Created design spec with theme "${parsedDesign.theme}"`);
+  }
+
+  // Update activeTask with progress if there are updates
+  const activeTaskUpdate: Partial<ActiveTask> | null = progressUpdates.length > 0
+    ? {
+        progress: progressUpdates,
+        ...(isDesignComplete && { assignedAgent: "orchestrator" as const }),
+      }
+    : null;
+
   return {
     messages: [response],
     currentAgent: "visual_designer",
@@ -644,6 +670,8 @@ The user is waiting for design options.`,
     ...(parsedDesign && { visualDesign: parsedDesign }),
     // Update work state based on phase/HITL analysis
     awaitingUserAction: newWorkState,
+    // Update activeTask with progress (reducer will merge with existing progress)
+    ...(activeTaskUpdate && { activeTask: activeTaskUpdate as ActiveTask }),
   };
 }
 

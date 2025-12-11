@@ -21,6 +21,7 @@ import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { OrchestratorState } from "../state/agent-state";
+import { generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
@@ -179,7 +180,16 @@ export async function mediaAgentNode(
   console.log("  Available tools:", mediaAgentTools.map((t: { name: string }) => t.name).join(", ") || "none");
   console.log("  Total tools:", mediaAgentTools.length);
 
-  const systemMessage = new SystemMessage({ content: MEDIA_AGENT_SYSTEM_PROMPT });
+  // Build system prompt with task context
+  let systemContent = MEDIA_AGENT_SYSTEM_PROMPT;
+  
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
+
+  const systemMessage = new SystemMessage({ content: systemContent });
 
   // Bind tools and invoke
   const modelWithTools = mediaAgentTools.length > 0

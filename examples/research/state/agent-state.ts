@@ -18,28 +18,32 @@ import { BaseMessage } from "@langchain/core/messages";
  * This prevents "RangeError: Invalid string length" during JSON serialization
  * by FileSystemPersistence (langgraph-cli dev mode).
  * 
- * Set conservatively to prevent state explosion while maintaining enough
- * context for effective agent operation.
+ * CRITICAL: Keep this LOW to prevent state explosion during serialization.
+ * Tool results can be very large (templates, hierarchy info), so even a 
+ * moderate number of messages can exceed JSON.stringify limits.
+ * 
+ * Note: Context management (processContext) handles LLM context separately.
+ * This limit is specifically for state persistence.
  */
-const MAX_MESSAGES_IN_STATE = 100;
+const MAX_MESSAGES_IN_STATE = 40;
 
 /**
  * Maximum number of written content entries to keep.
  * Prevents unbounded accumulation in long sessions.
  */
-const MAX_WRITTEN_CONTENT = 200;
+const MAX_WRITTEN_CONTENT = 50;
 
 /**
  * Maximum number of created nodes to track.
  * Prevents unbounded accumulation in long sessions.
  */
-const MAX_CREATED_NODES = 200;
+const MAX_CREATED_NODES = 50;
 
 /**
  * Maximum number of generated previews to keep.
  * Prevents unbounded accumulation in long sessions.
  */
-const MAX_GENERATED_PREVIEWS = 50;
+const MAX_GENERATED_PREVIEWS = 20;
 
 // ============================================================================
 // TYPE DEFINITIONS - Structured outputs from each agent
@@ -374,6 +378,77 @@ export interface ContentOutput {
 }
 
 /**
+ * Node snapshot summary - lightweight cache of getNodeTreeSnapshot results
+ * Stored in progress state to avoid repeated full snapshot calls
+ */
+export interface NodeSnapshotSummary {
+  /** Total nodes in project */
+  totalNodes: number;
+  /** Nodes by level (level number -> count) */
+  nodesByLevel: Record<number, number>;
+  /** Content Blocks that need content (IDs) */
+  contentBlocksNeedingContent: string[];
+  /** Content Blocks that have content (count only to save space) */
+  contentBlocksWithContentCount: number;
+  /** When snapshot was taken */
+  snapshotAt: string;
+}
+
+/**
+ * Writer progress state - maintains context across orchestrator round-trips.
+ * This is critical for long-running writer sessions where context trimming
+ * would otherwise cause the writer to lose track of its work.
+ */
+export interface WriterProgress {
+  /** Nodes the writer has already explored/navigated to */
+  exploredNodes: string[];
+  /** Current parent node ID the writer is working under */
+  currentParentId: string | null;
+  /** Current workflow phase */
+  workflow: "exploring" | "creating" | "reviewing";
+  /** Summary of recent tool calls for context */
+  toolCallSummary: string[];
+  /** Hierarchy info cached from exploration (to avoid re-fetching) */
+  hierarchyCache?: {
+    levelNames: string[];
+    maxDepth: number;
+    contentLevel: number;
+  };
+  /** Node snapshot summary (from getNodeTreeSnapshot) */
+  nodeSnapshot?: NodeSnapshotSummary;
+  /** Last update timestamp */
+  lastUpdated: string;
+}
+
+/**
+ * Architect progress state - maintains context across orchestrator round-trips.
+ * This is critical for long-running architect sessions where context trimming
+ * would otherwise cause the architect to lose track of its node creation work.
+ */
+export interface ArchitectProgress {
+  /** Current workflow phase */
+  workflow: "planning" | "awaiting_approval" | "building" | "complete";
+  /** Nodes the architect has already explored/navigated to */
+  exploredNodes: string[];
+  /** Summary of recent tool calls for context */
+  toolCallSummary: string[];
+  /** Hierarchy info cached from exploration (to avoid re-fetching) */
+  hierarchyCache?: {
+    levelNames: string[];
+    maxDepth: number;
+    templateIds: Record<string, string>; // nodeType -> templateId mapping
+  };
+  /** Node snapshot summary (from getNodeTreeSnapshot) */
+  nodeSnapshot?: NodeSnapshotSummary;
+  /** TempId to actual nodeId mapping for created nodes */
+  tempIdToNodeId: Record<string, string>;
+  /** Count of nodes created in this session */
+  nodesCreatedCount: number;
+  /** Last update timestamp */
+  lastUpdated: string;
+}
+
+/**
  * Tracks a node that has been created in this session.
  * Used to prevent duplicate creation.
  */
@@ -445,6 +520,33 @@ export interface AgentWorkState {
     optionsPresented?: number;
     [key: string]: unknown;
   };
+}
+
+/**
+ * Tracks the active task/goal being worked on.
+ * This persists across agent transitions to maintain context about:
+ * - What the user originally asked for
+ * - What we're trying to accomplish
+ * - Progress made so far
+ * 
+ * Essential for long-running threads where agents need to remember
+ * the current task even after context trimming occurs.
+ */
+export interface ActiveTask {
+  /** The user's original request that initiated this task */
+  originalRequest: string;
+  /** High-level description of what we're trying to accomplish */
+  currentGoal: string;
+  /** Which agent is currently responsible for this task */
+  assignedAgent: AgentType;
+  /** List of completed steps/milestones */
+  progress: string[];
+  /** When the task was started */
+  startedAt: string;
+  /** Optional: specific instructions passed to the assigned agent */
+  agentInstructions?: string;
+  /** Optional: expected next steps after current agent completes */
+  nextSteps?: string[];
 }
 
 /**
@@ -720,6 +822,92 @@ export const OrchestratorStateAnnotation = Annotation.Root({
     default: () => [],
   }),
 
+  /**
+   * Writer-specific message channel.
+   * Persists the writer's conversation independently from the main messages channel.
+   * This prevents context loss when the writer hands back to orchestrator and returns.
+   * Capped at 50 messages to prevent unbounded growth.
+   */
+  writerMessages: Annotation<BaseMessage[]>({
+    reducer: (existing, update) => {
+      // Accumulate messages
+      const accumulated = [...(existing || []), ...(update || [])];
+      // Cap at 50 messages to prevent state explosion
+      if (accumulated.length > 50) {
+        return accumulated.slice(-50);
+      }
+      return accumulated;
+    },
+    default: () => [],
+  }),
+
+  /**
+   * Writer progress state - semantic context for writer continuity.
+   * Tracks what the writer has explored and created, surviving orchestrator round-trips.
+   */
+  writerProgress: Annotation<WriterProgress | null>({
+    reducer: (existing, update) => {
+      if (update === undefined) return existing;
+      if (update === null) return null;
+      if (!existing) return update;
+      // Merge: accumulate explored nodes and tool summaries
+      const mergedExplored = [...new Set([...(existing.exploredNodes || []), ...(update.exploredNodes || [])])];
+      const mergedToolSummary = [...(existing.toolCallSummary || []), ...(update.toolCallSummary || [])].slice(-20);
+      return {
+        ...existing,
+        ...update,
+        exploredNodes: mergedExplored.slice(-50), // Cap explored nodes
+        toolCallSummary: mergedToolSummary,
+      };
+    },
+    default: () => null,
+  }),
+
+  /**
+   * Architect-specific message channel.
+   * Persists the architect's conversation independently from the main messages channel.
+   * This prevents context loss when the architect hands back to orchestrator and returns.
+   * Capped at 50 messages to prevent unbounded growth.
+   */
+  architectMessages: Annotation<BaseMessage[]>({
+    reducer: (existing, update) => {
+      // Accumulate messages
+      const accumulated = [...(existing || []), ...(update || [])];
+      // Cap at 50 messages to prevent state explosion
+      if (accumulated.length > 50) {
+        return accumulated.slice(-50);
+      }
+      return accumulated;
+    },
+    default: () => [],
+  }),
+
+  /**
+   * Architect progress state - semantic context for architect continuity.
+   * Tracks what the architect has explored and created, surviving orchestrator round-trips.
+   * Critical for maintaining tempId -> nodeId mappings during node creation.
+   */
+  architectProgress: Annotation<ArchitectProgress | null>({
+    reducer: (existing, update) => {
+      if (update === undefined) return existing;
+      if (update === null) return null;
+      if (!existing) return update;
+      // Merge: accumulate explored nodes, tool summaries, and tempId mappings
+      const mergedExplored = [...new Set([...(existing.exploredNodes || []), ...(update.exploredNodes || [])])];
+      const mergedToolSummary = [...(existing.toolCallSummary || []), ...(update.toolCallSummary || [])].slice(-20);
+      const mergedTempIdMap = { ...(existing.tempIdToNodeId || {}), ...(update.tempIdToNodeId || {}) };
+      return {
+        ...existing,
+        ...update,
+        exploredNodes: mergedExplored.slice(-50), // Cap explored nodes
+        toolCallSummary: mergedToolSummary,
+        tempIdToNodeId: mergedTempIdMap,
+        nodesCreatedCount: (existing.nodesCreatedCount || 0) + (update.nodesCreatedCount || 0),
+      };
+    },
+    default: () => null,
+  }),
+
   // ---- Execution Tracking ----
 
   /** Track created nodes to prevent duplicates (capped at MAX_CREATED_NODES) */
@@ -758,6 +946,39 @@ export const OrchestratorStateAnnotation = Annotation.Root({
    */
   awaitingUserAction: Annotation<AgentWorkState | null>({
     reducer: (existing, update) => update === undefined ? existing : update,
+    default: () => null,
+  }),
+
+  /**
+   * Tracks the active task/goal being worked on.
+   * Persists across agent transitions to maintain context about:
+   * - What the user originally asked for
+   * - What we're trying to accomplish
+   * - Progress made so far
+   * 
+   * This is critical for long-running threads where context trimming
+   * may remove the original user request from the message history.
+   * Supervisor sets this when routing to an agent, and agents update
+   * the progress array as they complete steps.
+   */
+  activeTask: Annotation<ActiveTask | null>({
+    reducer: (existing, update) => {
+      if (update === undefined) return existing;
+      if (update === null) return null;
+      // Merge progress arrays when updating
+      if (existing && update) {
+        const mergedProgress = [...(existing.progress || [])];
+        for (const step of update.progress || []) {
+          if (!mergedProgress.includes(step)) {
+            mergedProgress.push(step);
+          }
+        }
+        // Cap progress at 20 entries to prevent state explosion
+        const cappedProgress = mergedProgress.slice(-20);
+        return { ...existing, ...update, progress: cappedProgress };
+      }
+      return update;
+    },
     default: () => null,
   }),
 
@@ -824,6 +1045,82 @@ export function summarizeAgentContext(state: OrchestratorState): string {
   }
   
   return parts.length > 0 ? parts.join(" | ") : "No agent context yet";
+}
+
+/**
+ * Generates a task context summary for injection into agent system prompts.
+ * This ensures agents always know:
+ * - What the user originally requested
+ * - What the current goal is
+ * - What progress has been made
+ * - What other agents have produced
+ * 
+ * This is critical for maintaining context in long-running threads where
+ * message trimming may have removed the original user request.
+ */
+export function generateTaskContext(state: OrchestratorState): string {
+  const sections: string[] = [];
+
+  // Active task context (most important - what we're working on)
+  if (state.activeTask) {
+    sections.push(`## Current Task
+
+**Original User Request:**
+${state.activeTask.originalRequest}
+
+**Current Goal:**
+${state.activeTask.currentGoal}
+
+**Assigned Agent:** ${state.activeTask.assignedAgent}
+**Started:** ${state.activeTask.startedAt}
+${state.activeTask.agentInstructions ? `\n**Instructions:** ${state.activeTask.agentInstructions}` : ""}
+${state.activeTask.progress.length > 0 ? `\n**Progress Made:**\n${state.activeTask.progress.map(p => `- ${p}`).join("\n")}` : ""}
+${state.activeTask.nextSteps?.length ? `\n**Expected Next Steps:**\n${state.activeTask.nextSteps.map(s => `- ${s}`).join("\n")}` : ""}`);
+  }
+
+  // Work already completed by other agents
+  const completedWork: string[] = [];
+  
+  if (state.projectBrief) {
+    completedWork.push(`- **Project Brief** (Strategist): Purpose is "${state.projectBrief.purpose.substring(0, 100)}...", ${state.projectBrief.objectives.length} objectives defined, targeting ${state.projectBrief.targetAudience} in ${state.projectBrief.industry}`);
+  }
+  
+  if (state.researchFindings) {
+    completedWork.push(`- **Research** (Researcher): ${state.researchFindings.keyTopics.length} key topics identified, ${state.researchFindings.citations.length} citations gathered`);
+  }
+  
+  if (state.plannedStructure) {
+    const executed = Object.keys(state.plannedStructure.executedNodes || {}).length;
+    completedWork.push(`- **Course Plan** (Architect): ${state.plannedStructure.nodes.length} nodes planned, ${executed} created, status: ${state.plannedStructure.executionStatus}`);
+  }
+  
+  if (state.courseStructure) {
+    completedWork.push(`- **Course Structure** (Architect): ${state.courseStructure.totalNodes} total nodes, ${state.courseStructure.maxDepth} levels deep`);
+  }
+  
+  if (state.visualDesign) {
+    completedWork.push(`- **Visual Design** (Designer): Theme "${state.visualDesign.theme}", tone "${state.visualDesign.writingTone.tone}"`);
+  }
+  
+  if (state.writtenContent && state.writtenContent.length > 0) {
+    completedWork.push(`- **Content** (Writer): ${state.writtenContent.length} content nodes created`);
+  }
+
+  if (completedWork.length > 0) {
+    sections.push(`## Completed Work\n\n${completedWork.join("\n")}`);
+  }
+
+  // Current agent work state (phase info)
+  if (state.awaitingUserAction) {
+    sections.push(`## Current Work State
+
+**Agent:** ${state.awaitingUserAction.agent}
+**Phase:** ${state.awaitingUserAction.phase}
+${state.awaitingUserAction.pendingTool ? `**Pending Tool:** ${state.awaitingUserAction.pendingTool}` : ""}
+${state.awaitingUserAction.allowedTools?.length ? `**Allowed Tools:** ${state.awaitingUserAction.allowedTools.join(", ")}` : ""}`);
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : "";
 }
 
 /**

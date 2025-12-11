@@ -20,6 +20,7 @@ import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { OrchestratorState } from "../state/agent-state";
+import { generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
@@ -161,7 +162,16 @@ export async function projectAgentNode(
   console.log("  Available tools:", projectAgentTools.map((t: { name: string }) => t.name).join(", ") || "none");
   console.log("  Total tools:", projectAgentTools.length);
 
-  const systemMessage = new SystemMessage({ content: PROJECT_AGENT_SYSTEM_PROMPT });
+  // Build system prompt with task context
+  let systemContent = PROJECT_AGENT_SYSTEM_PROMPT;
+  
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
+
+  const systemMessage = new SystemMessage({ content: systemContent });
 
   // Bind tools and invoke
   const modelWithTools = projectAgentTools.length > 0

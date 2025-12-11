@@ -7,8 +7,8 @@
  * Sub-agents:
  * - Strategist: Discovers purpose, objectives, scope, constraints
  * - Researcher: Deep knowledge gathering on industry and topics
- * - Architect: Structures course for maximum learning impact
- * - Writer: Creates Level 6 content nodes
+ * - Architect: Designs structure, presents plan for approval, builds complete skeleton (L2-L6)
+ * - Writer: Fills in content within existing Content Block nodes
  * - Visual Designer: Defines aesthetics and writing tone
  *
  * Based on CopilotKit frontend actions pattern:
@@ -30,7 +30,9 @@ import {
   OrchestratorStateAnnotation,
   OrchestratorState,
   AgentType,
+  ActiveTask,
   summarizeAgentContext,
+  generateTaskContext,
 } from "./state/agent-state";
 
 // Centralized context management utilities
@@ -201,14 +203,14 @@ You have 7 specialized sub-agents, each with specific capabilities:
 **Output**: Research findings with industry context, key topics, regulations
 
 ### 3. The Architect
-**When to use**: After research is complete, to design course structure
-**Capabilities**: Analyzes hierarchy, designs node structure, plans content flow
-**Output**: Course structure with planned nodes and learning progression
+**When to use**: After research is complete, to design and build course structure
+**Capabilities**: Analyzes hierarchy, designs node structure, presents plan for approval, builds complete skeleton
+**Output**: Presents plan to user, gets approval, then creates structure from L2 down to Content Blocks
 
 ### 4. The Writer
-**When to use**: After structure is approved, to create actual content
-**Capabilities**: Creates nodes, writes content, manages edit mode
-**Output**: Written content nodes following the structure
+**When to use**: After Architect has built the structure, to fill in content
+**Capabilities**: Updates existing nodes with content, writes text, attaches media
+**Output**: Populated Content Block nodes with actual training content
 
 ### 5. The Visual Designer
 **When to use**: Early in process to define look/feel, or when user asks about design
@@ -231,13 +233,12 @@ You have 7 specialized sub-agents, each with specific capabilities:
 1. Strategist → Gather requirements
 2. Visual Designer → Define aesthetics (can run parallel with research)
 3. Researcher → Deep knowledge gathering
-4. Architect → Design course structure
-5. Get approval → User reviews structure
-6. Writer → Create content nodes
+4. Architect → Design structure, present plan, get approval, build complete skeleton (L2-L6)
+5. Writer → Fill in content within the existing Content Block nodes
 
 ### Quick Content Addition
-1. Architect → Plan new content location
-2. Writer → Create the content
+1. Architect → Plan and build new structure nodes
+2. Writer → Fill in the content
 
 ### Research Deep-Dive
 1. Researcher → Extended research on specific topics
@@ -319,6 +320,7 @@ The CopilotKit context already tells you which project the user is in. Check the
 - Only call listProjects when the user explicitly asks to see ALL projects or search for projects
 
 ### Node Information (Read-only)
+- **getNodeTreeSnapshot(maxNodes?, includeFieldStatus?)** - **RECOMMENDED** Get ALL nodes in ONE call with content status. Eliminates multiple tool calls for structure discovery.
 - **getProjectHierarchyInfo()** - Get hierarchy levels, coding config, structure info
 - **getNodeChildren(nodeId?)** - Get children of a node (uses selected node if no ID)
 - **getNodeDetails(nodeId?)** - Get detailed info about a node
@@ -414,19 +416,22 @@ Do NOT just write out options as text - the tools provide a better UI experience
 - Creating projects
 - Navigating to projects (but NOT "show in table view" requests)
 - Listing projects, nodes, templates
-- Creating simple nodes (structural, categories)
 - Checking project structure (but NOT table data queries)
 - Any quick, straightforward action that doesn't involve table view
+
+**NOTE**: Do NOT create course structure nodes yourself - that's the Architect's job. The Architect designs the plan, presents it to the user for approval, and builds the complete structure.
 
 ### INVOLVE SPECIALISTS (only when user explicitly requests):
 - **Data Agent**: When user asks for "table view", "show me nodes", data filtering/sorting/grouping
 - **Strategist**: When user asks to gather requirements for a new training project
 - **Researcher**: When user asks for deep research, web search, document analysis
-- **Architect**: When user asks to design course structures with learning progressions
-- **Writer**: When user asks to create rich content nodes with detailed content
+- **Architect**: When user asks to design/build course structures - the Architect will present its plan and get user approval directly
+- **Writer**: When user asks to write/fill in content within existing nodes
 - **Visual Designer**: When user asks to define visual aesthetics, colors, fonts, tone
 
 **Remember**: Always ask the user before involving a specialist. Don't auto-route.
+
+**Architect Note**: Once you route to the Architect, it handles the entire structure process including presenting the plan to the user and getting approval. You don't need to intermediate the approval - the Architect uses requestPlanApproval directly.
 
 ## Decision Making
 
@@ -527,6 +532,94 @@ The user already made their choice. Execute it.
 This section will be updated with the current state of agent outputs.`;
 
 // ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Extracts the most recent substantive user request from messages.
+ * Looks for the most recent human message that isn't a simple acknowledgment.
+ * Used to set the originalRequest field in activeTask.
+ */
+function extractOriginalRequest(messages: BaseMessage[]): string {
+  // Find the most recent human message that's substantive (not just "ok", "yes", etc.)
+  const humanMessages = messages.filter(m => {
+    const msgType = (m as any)._getType?.() || (m as any).constructor?.name || "";
+    return msgType === "human" || msgType === "HumanMessage";
+  });
+
+  // Simple acknowledgments to skip
+  const acknowledgments = ["ok", "okay", "yes", "no", "sure", "thanks", "thank you", "got it"];
+
+  // Work backwards to find the most recent substantive message
+  for (let i = humanMessages.length - 1; i >= 0; i--) {
+    const msg = humanMessages[i];
+    const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+    const trimmed = content.trim().toLowerCase();
+    
+    // Skip if it's just an acknowledgment
+    if (acknowledgments.includes(trimmed)) {
+      continue;
+    }
+    
+    // Skip very short messages (likely selections or simple responses)
+    if (trimmed.length < 10) {
+      continue;
+    }
+
+    return content;
+  }
+
+  // If no substantive message found, use the last human message
+  if (humanMessages.length > 0) {
+    const lastHuman = humanMessages[humanMessages.length - 1];
+    return typeof lastHuman.content === "string" ? lastHuman.content : JSON.stringify(lastHuman.content);
+  }
+
+  return "No user request found";
+}
+
+/**
+ * Generates a goal description for the agent being routed to.
+ * Based on the agent type and available context.
+ */
+function generateGoalForAgent(agent: AgentType, state: OrchestratorState, answer: string): string {
+  switch (agent) {
+    case "strategist":
+      return "Gather project requirements by asking clarifying questions and create a project brief";
+    case "researcher":
+      return state.projectBrief
+        ? `Research and gather information about ${state.projectBrief.industry} for ${state.projectBrief.purpose}`
+        : "Conduct research to gather relevant information for the training project";
+    case "architect":
+      return state.researchFindings
+        ? "Design the course structure based on the research findings and project brief"
+        : "Design the course structure for the training project";
+    case "writer":
+      return state.courseStructure
+        ? `Create content for the ${state.courseStructure.totalNodes} planned nodes in the course structure`
+        : "Write engaging training content following the course structure";
+    case "visual_designer":
+      return "Define the visual design, color scheme, typography, and writing tone for the training";
+    case "builder_agent":
+      return "Generate visual previews and render e-learning components";
+    case "data_agent":
+      return "Handle table view operations, filtering, sorting, and data queries";
+    case "document_agent":
+      return "Search and analyze uploaded documents";
+    case "media_agent":
+      return "Search and manage media assets from the library";
+    case "framework_agent":
+      return "Work with competency frameworks and criteria mapping";
+    case "project_agent":
+      return "Manage project operations (creation, navigation, listing)";
+    case "node_agent":
+      return "Handle node operations and template management";
+    default:
+      return answer; // Use the supervisor's answer as the goal
+  }
+}
+
+// ============================================================================
 // SUPERVISOR (ORCHESTRATOR) NODE - CopilotKit Supervisor Pattern
 // ============================================================================
 
@@ -619,6 +712,22 @@ async function supervisorNode(
   // Build dynamic system prompt with context
   let systemContent = ORCHESTRATOR_SYSTEM_PROMPT;
 
+  // Add active task context (most important - what we're currently working on)
+  if (state.activeTask) {
+    systemContent += `\n\n## ACTIVE TASK (CRITICAL - This is what we're working on)
+
+**Original User Request:**
+${state.activeTask.originalRequest}
+
+**Current Goal:** ${state.activeTask.currentGoal}
+**Assigned to:** ${state.activeTask.assignedAgent}
+**Started:** ${state.activeTask.startedAt}
+${state.activeTask.progress.length > 0 ? `\n**Progress Made:**\n${state.activeTask.progress.map(p => `- ${p}`).join("\n")}` : ""}
+
+IMPORTANT: Keep this task in mind when routing to agents. If the task is not complete, 
+continue routing to the appropriate agent to finish it.`;
+  }
+
   // Add current context summary
   systemContent += `\n\n## Current Agent Context\n`;
 
@@ -688,8 +797,8 @@ Consider starting with the Strategist to gather requirements.`;
 ### Available sub-agents:
 - **strategist** - For requirements gathering, project brief creation
 - **researcher** - For knowledge gathering, web search, document search
-- **architect** - For course structure design, hierarchy planning
-- **writer** - For content creation, node writing
+- **architect** - For course structure design, plan presentation, approval, and building (handles entire structure workflow)
+- **writer** - For filling in content within existing Content Block nodes
 - **visual_designer** - For design and aesthetics
 - **builder_agent** - For preview generation, e-learning component rendering
 - **project_agent** - For project listing, creation, navigation
@@ -747,13 +856,23 @@ Consider starting with the Strategist to gather requirements.`;
       'getNodeDetails',
       'getNodeChildren',
       'getCurrentProject',
-      'getProjectHierarchyInfo'
+      'getProjectHierarchyInfo',
+      'batchCreateNodes',            // Critical for tracking created nodes
+      'createNode',                  // Track individual node creation
     ],
     // Summarization: Less aggressive condensation
     enableSummarization: true,
     summarizeTriggerTokens: 25000,  // Increased from 15000 - trigger later
     summarizeKeepMessages: 15,      // Increased from 8 - keep more messages
     logPrefix: "[supervisor]",
+    // Task preservation: Keep messages containing the original user request
+    originalRequest: state.activeTask?.originalRequest,
+    // CRITICAL: Include batchCreateNodes keywords to prevent re-execution after context trimming
+    preserveKeywords: [
+      "project brief", "training", "course", "module", "lesson",
+      "batchCreateNodes", "tempIdToNodeId", "nodesCreatedCount", "completedTempIds",
+      "Successfully created", "DO NOT call batchCreateNodes again",
+    ],
   });
 
   const customConfig = copilotkitCustomizeConfig(config, {
@@ -810,24 +929,61 @@ Consider starting with the Strategist to gather requirements.`;
           console.warn("[supervisor] WARNING: Routing to writer but courseStructure is null. Consider running architect first.");
         }
         
+        // Create or update activeTask for context persistence
+        // This ensures agents know what they're working on even after context trimming
+        const originalRequest = state.activeTask?.originalRequest || extractOriginalRequest(updatedMessages);
+        const currentGoal = generateGoalForAgent(nextAgent as AgentType, state, args.answer);
+        
+        const newActiveTask: ActiveTask = {
+          originalRequest,
+          currentGoal,
+          assignedAgent: nextAgent as AgentType,
+          progress: state.activeTask?.progress || [],
+          startedAt: state.activeTask?.startedAt || new Date().toISOString(),
+          agentInstructions: args.answer, // Use the supervisor's answer as instructions
+        };
+        
         console.log(`  -> Routing to sub-agent: ${nextAgent}`);
+        console.log(`  -> Active task: ${currentGoal.substring(0, 80)}...`);
+        
+        // Clear writer state when LEAVING the writer agent to go to a different agent
+        // This ensures fresh context on next writer invocation for a new task
+        const writerStateClear: Partial<OrchestratorState> = {};
+        if (state.currentAgent === "writer" && nextAgent !== "writer") {
+          console.log("  -> Clearing writer state (leaving writer agent)");
+          writerStateClear.writerMessages = [];
+          writerStateClear.writerProgress = null;
+        }
+        
         return new Command({
           goto: nextAgent,
           update: {
             messages: updatedMessages,
             currentAgent: nextAgent as AgentType,
             agentHistory: [nextAgent as AgentType],
+            activeTask: newActiveTask,
+            ...writerStateClear,
           },
         });
       }
       
       // supervisor_response with 'complete' or no next_agent - return with answer
       console.log("  -> Routing to END (supervisor response complete)");
+      
+      // Clear writer state when completing a task (if writer was the last active agent)
+      const writerStateClearOnComplete: Partial<OrchestratorState> = {};
+      if (state.currentAgent === "writer") {
+        console.log("  -> Clearing writer state (task complete from writer)");
+        writerStateClearOnComplete.writerMessages = [];
+        writerStateClearOnComplete.writerProgress = null;
+      }
+      
       return new Command({
         goto: END,
         update: {
           messages: updatedMessages,
           currentAgent: "orchestrator" as AgentType,
+          ...writerStateClearOnComplete,
         },
       });
     }

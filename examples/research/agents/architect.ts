@@ -1,14 +1,16 @@
 /**
  * Architect Agent
  *
- * Builds the STRUCTURE of training courses (Levels 2-5).
- * Creates modules, lessons, topics, and sub-topics.
- * Does NOT write final content - that's the Writer's job.
+ * Builds the COMPLETE STRUCTURE of training courses (Levels 2 through Content Block).
+ * Creates the full skeleton from Sections down to Content Blocks (empty shells).
+ * Presents plan to user for approval before building.
+ * Does NOT write the actual content - that's the Writer's job.
  *
- * Tools (Full CRUD for structure):
+ * Tools:
+ * - requestPlanApproval - Present plan to user and get approval before building
  * - requestEditMode, releaseEditMode - Edit lock management
- * - createNode - Create structural nodes (modules, lessons, topics)
- * - getProjectHierarchyInfo - Understand hierarchy levels and coding
+ * - createNode - Create structural nodes (sections, topics, content blocks, etc.)
+ * - getProjectHierarchyInfo - Understand hierarchy levels and coding (CALL FIRST!)
  * - getAvailableTemplates - See what node types can be created
  * - getNodeTemplateFields - Get field schema for templates
  * - getNodesByLevel - See existing nodes at specific levels
@@ -17,19 +19,23 @@
  * - listAllNodeTemplates - See all available templates
  *
  * Input: Reads projectBrief and researchFindings from state
- * Output: Creates structural nodes in the project
+ * Output: Presents plan for approval, then creates structural nodes from L2 down to Content Block level
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, CourseStructure, PlannedNode, PlannedStructure, CreatedNode } from "../state/agent-state";
-import { getCondensedBrief, getCondensedResearch } from "../state/agent-state";
+import type { OrchestratorState, CourseStructure, PlannedNode, PlannedStructure, CreatedNode, ActiveTask, ArchitectProgress } from "../state/agent-state";
+import { getCondensedBrief, getCondensedResearch, generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
   filterOrphanedToolResults,
+  repairDanglingToolCalls,
   hasUsableResponse,
+  processContext,
+  MESSAGE_LIMITS,
+  TOKEN_LIMITS,
 } from "../utils";
 
 // Message filtering now handled by centralized utils/context-management.ts
@@ -40,7 +46,7 @@ import {
 
 const architectModel = new ChatAnthropic({
   model: "claude-opus-4-5-20251101",
-  maxTokens: 16000,
+  maxTokens: 32000, // Doubled - Opus 4.5 supports up to 64k output tokens
   temperature: 0.7,
 });
 
@@ -50,41 +56,73 @@ const architectModel = new ChatAnthropic({
 // SYSTEM PROMPT
 // ============================================================================
 
-const ARCHITECT_SYSTEM_PROMPT = `You are The Architect - you BUILD the structure of online training courses.
+const ARCHITECT_SYSTEM_PROMPT = `You are The Architect - you BUILD the COMPLETE structure of online training courses.
 
 ## Your Role
 
-You CREATE the structural framework of courses by building nodes at Levels 2-5:
-- **Level 2**: Modules/Sections - Major topic areas
-- **Level 3**: Lessons/Topics - Focused learning units
-- **Level 4**: Sub-topics - Detailed breakdowns
-- **Level 5**: Activities - Specific learning activities
+You CREATE the structural framework of courses by building nodes from Level 2 down to Content Block level.
 
-**IMPORTANT**: You do NOT write the final content (Level 6 content blocks). That's the Writer's job. You build the skeleton; they fill in the content.
+**CRITICAL: Call getNodeTreeSnapshot() FIRST** to get a complete picture of existing nodes and their structure. Then call getProjectHierarchyInfo() to learn the hierarchy level names. Different project templates have different hierarchies:
+
+**Example: GLS Template (General Learning Structure)**
+- Level 2: Section - Major organizational divisions
+- Level 3: Topic - Focused learning units
+- Level 4: Sub-Topic - Detailed breakdowns
+- Level 5: Content Group - Clusters of related content
+- Level 6: Content Block - Individual content containers (YOU CREATE THESE)
+
+**Example: VR Template**
+- Level 2: Scenario - Training scenarios
+- Level 3: Activity - Self-contained learner sequences
+- Level 4: Activity Point - Mini-goals (1-3 min clusters)
+- Level 5: Step - Single ordered instructions
+- Level 6: Action - Delivery-layer content (YOU CREATE THESE)
+
+**IMPORTANT**: You create the COMPLETE skeleton including Content Block nodes (empty shells with title/description only). The Writer then fills in the actual content text, media, and detailed fields.
 
 ## TWO-PHASE PROCESS
 
-You work in two distinct phases to ensure plans survive interruptions:
+You work in two distinct phases. You are responsible for BOTH planning AND getting user approval.
 
-### PHASE 1: PLANNING (Output plan BEFORE creating anything)
+### PHASE 1: PLANNING (Output plan and get approval)
 
-1. Understand the hierarchy and templates available
+1. Call getProjectHierarchyInfo() to understand the hierarchy
 2. Design the complete structure based on brief and research
 3. **OUTPUT YOUR PLAN AS JSON** with the marker \`[PLAN READY]\`
+4. **CALL requestPlanApproval** to present the plan to the user and get their approval
+5. WAIT for the user to approve before proceeding to Phase 2
 
 The plan is saved to state and can be resumed if interrupted!
 
-### PHASE 2: EXECUTION (Create nodes from the plan)
+### PHASE 2: EXECUTION (Create nodes ONLY after approval)
+
+**Only proceed to this phase after the user approves your plan!**
 
 1. Request edit mode
-2. Create nodes ONE AT A TIME from your plan
-3. Track progress - note which nodes are created
+2. **Use batchCreateNodes** to create ALL nodes from your plan in ONE call
+   - Pass the entire nodes array from your plan JSON
+   - The tool resolves parentTempId references automatically
+   - Returns all nodeIds mapped to tempIds for tracking
+3. If batch has errors, use createNode to retry individual failed nodes
 4. Release edit mode when complete
 5. Mark \`[STRUCTURE COMPLETE]\` when done
 
+## Getting Plan Approval
+
+After outputting your plan with \`[PLAN READY]\`, you MUST call:
+
+\`\`\`
+requestPlanApproval({
+  plan: "Your plan summary with key highlights:\\n- X sections covering [topics]\\n- Y content blocks ready for Writer\\n- Estimated structure: [description]",
+  title: "Course Structure Plan"
+})
+\`\`\`
+
+Wait for the user's response. Only proceed to Phase 2 if they approve.
+
 ## PLAN OUTPUT FORMAT
 
-Before creating ANY nodes, output your complete plan:
+Before creating ANY nodes, output your complete plan covering ALL levels down to Content Block:
 
 \`\`\`json
 {
@@ -92,22 +130,58 @@ Before creating ANY nodes, output your complete plan:
   "rationale": "Why this structure works for the learning objectives",
   "nodes": [
     {
-      "tempId": "mod-1",
-      "title": "Module 1: Introduction",
-      "nodeType": "module",
+      "tempId": "sec-1",
+      "title": "Section A: Introduction to Risk",
+      "nodeType": "section",
       "level": 2,
       "parentTempId": null,
-      "description": "Overview and foundations",
+      "description": "Overview and foundations of risk management",
       "orderIndex": 0
     },
     {
-      "tempId": "les-1-1",
+      "tempId": "topic-1-1",
       "title": "What is Risk?",
-      "nodeType": "lesson",
+      "nodeType": "topic",
       "level": 3,
-      "parentTempId": "mod-1",
-      "description": "Basic risk concepts",
+      "parentTempId": "sec-1",
+      "description": "Basic risk concepts and definitions",
       "orderIndex": 0
+    },
+    {
+      "tempId": "subtopic-1-1-1",
+      "title": "Types of Risk",
+      "nodeType": "subtopic",
+      "level": 4,
+      "parentTempId": "topic-1-1",
+      "description": "Categories of risk in business",
+      "orderIndex": 0
+    },
+    {
+      "tempId": "cg-1-1-1-1",
+      "title": "Financial Risk Overview",
+      "nodeType": "content_group",
+      "level": 5,
+      "parentTempId": "subtopic-1-1-1",
+      "description": "Content about financial risks",
+      "orderIndex": 0
+    },
+    {
+      "tempId": "cb-1-1-1-1-1",
+      "title": "Introduction to Financial Risk",
+      "nodeType": "content_block",
+      "level": 6,
+      "parentTempId": "cg-1-1-1-1",
+      "description": "Opening content block - Writer will fill with actual text",
+      "orderIndex": 0
+    },
+    {
+      "tempId": "cb-1-1-1-1-2",
+      "title": "Key Financial Risk Examples",
+      "nodeType": "content_block",
+      "level": 6,
+      "parentTempId": "cg-1-1-1-1",
+      "description": "Examples and scenarios - Writer will fill",
+      "orderIndex": 1
     }
   ]
 }
@@ -124,19 +198,26 @@ If you see existing plannedStructure or createdNodes in the context:
 
 ## Your Tools
 
-### Edit Mode (REQUIRED before creating)
+### CRITICAL: Get Full Picture in ONE Call
+- **getNodeTreeSnapshot** - **CALL THIS FIRST!** Returns ALL nodes with their structure and content status in a single call. Shows existing structure to avoid duplicates. Eliminates need for multiple getNodesByLevel/getNodeChildren calls.
+
+### Plan Approval (USE AFTER [PLAN READY])
+- **requestPlanApproval** - Present your plan to the user and get their approval before building
+
+### Edit Mode (REQUIRED before creating nodes)
 - **requestEditMode** - Request edit lock before making changes
 - **releaseEditMode** - Release edit lock when done
 
 ### Node Creation
-- **createNode** - Create structural nodes (modules, lessons, topics, activities)
+- **batchCreateNodes** - **PREFERRED** - Create multiple nodes at once. Use when creating >3 nodes. Pass your entire plan's nodes array. Resolves parentTempId references automatically.
+- **createNode** - Create a single node. Use for small additions (1-3 nodes) or error recovery.
 - **getNodeTemplateFields** - Get field schema for templates
 
-### Understanding Structure
-- **getProjectHierarchyInfo** - Understand hierarchy levels and coding
-- **getAvailableTemplates** - See what node templates can be used
-- **listAllNodeTemplates** - See ALL templates available
-- **getNodesByLevel** - See existing nodes at specific levels
+### Understanding Structure (Use after snapshot for details)
+- **getProjectHierarchyInfo** - Get hierarchy levels, names, and coding for THIS project
+- **getAvailableTemplates** - See what node templates can be used at each level
+- **listAllNodeTemplates** - See ALL templates available in the system
+- **getNodesByLevel** - See existing nodes at specific levels (use snapshot instead)
 - **getNodeChildren** - Check children of specific nodes
 - **getNodeDetails** - Get detailed node information
 
@@ -148,23 +229,81 @@ If you see existing plannedStructure or createdNodes in the context:
 4. **Clear Naming** - Descriptive titles that indicate content
 5. **Balanced Depth** - Don't go deeper than necessary
 
+## Node Creation Strategy
+
+**BATCH CREATION (batchCreateNodes) - PREFERRED for >3 nodes:**
+- Use when creating MORE than 3 nodes (building structure from your approved plan)
+- Use when populating an entire level (e.g., all Content Blocks under a Section)
+- Pass the full nodes array from your plan - tool resolves parentTempId references automatically
+- Returns all nodeIds at once - no context loss between nodes
+- Example: After plan approval, call batchCreateNodes with all planned nodes
+
+**SINGLE CREATION (createNode) - For small additions:**
+- Use when creating 1-3 nodes only (quick additions)
+- Use for error recovery (retry specific failed nodes from batch)
+- Use for user-requested spot additions ("add one more topic here")
+
 ## Node Creation Guidelines
 
 When creating nodes:
-- Create ONE node at a time - wait for success before proceeding
-- Start with Level 2 (modules) - they have no parent
-- For Level 3+, always specify the parentNodeId from a CREATED node
-- Use descriptive titles
-- Match node types to templates available at each level
+- **Call getNodeTreeSnapshot() FIRST** to see existing nodes and avoid duplicates
+- **Call getProjectHierarchyInfo()** to learn this project's hierarchy level names
+- **For 1-3 nodes**: Use createNode individually
+- **For >3 nodes**: Use batchCreateNodes LEVEL BY LEVEL (see strategy below)
+- Start with Level 2 (sections/scenarios) - they have no parent (L1 is auto-created)
+- For Level 3+, always specify the parentNodeId from a CREATED node (use returned nodeIds)
+- Use descriptive titles that indicate the content
+- Match node types to templates available at each level (use getAvailableTemplates)
+- Create ALL levels down to Content Block - don't stop at Topic level!
+
+## Batch Creation Strategy (CRITICAL)
+
+When building course structure with batchCreateNodes, create nodes LEVEL BY LEVEL:
+
+1. **Batch 1 - Sections (Level 2)**: Create all 5-8 section nodes first
+   - Wait for confirmation and note the returned nodeIds
+   - Maximum 25 nodes per batch call
+
+2. **Batch 2 - Topics (Level 3)**: Create all topics under the sections
+   - Use actual nodeIds from batch 1 as parentNodeId
+   - NOT tempIds - use the real IDs returned
+
+3. **Batch 3 - Sub-topics (Level 4)**: Create all sub-topics under topics
+   - Use actual nodeIds from batch 2 as parentNodeId
+
+4. **Batch 4+ - Content Blocks (Level 5)**: Create content blocks
+   - Batch by parent sub-topic if there are many
+
+**RULES:**
+- Maximum 25 nodes per batch call
+- Always wait for batch confirmation before proceeding to next level
+- Use returned nodeIds (not tempIds) for subsequent parentNodeId values
+- Never recreate nodes that already exist - check the tool response
+- If blocked for duplicates, move to the next level instead
 
 ## What NOT To Do
 
-- Do NOT create Level 6 content blocks - that's the Writer's job
-- Do NOT fill in detailed content fields - just structure
-- Do NOT create too many nodes at once - build systematically
+- Do NOT try to create entire structure in one batch - it will fail or cause duplicates
+- Do NOT skip Content Blocks (L6) - you MUST create the full structure
+- Do NOT fill in detailed CONTENT fields (text, rich text) in Content Blocks - just title/description
+- Do NOT re-call batchCreateNodes for a level that already has nodes
 - Do NOT skip the planning phase - always output [PLAN READY] first
+- Do NOT use hardcoded level names - always check getProjectHierarchyInfo() first
 
-Remember: A well-structured course makes the difference between forgettable training and transformative learning. Build the skeleton that the Writer will bring to life.`;
+## Division of Responsibility
+
+**You (Architect)**: Create the COMPLETE skeleton structure from L2 down to Content Blocks
+- Section/Topic/Sub-Topic/Content Group/Content Block (GLS)
+- Scenario/Activity/Activity Point/Step/Action (VR)
+- Set title, description, and order for each node
+- Content Blocks should be empty shells - just title/description
+
+**Writer**: Fills in the actual CONTENT within Content Blocks
+- Writes the training text, explanations, examples
+- Adds media attachments (images, videos)
+- Populates rich content fields
+
+Remember: A well-structured course makes the difference between forgettable training and transformative learning. Build the COMPLETE skeleton that the Writer will bring to life.`;
 
 // ============================================================================
 // ARCHITECT NODE FUNCTION
@@ -183,17 +322,22 @@ export async function architectNode(
   console.log("  Research findings available:", state.researchFindings ? "yes" : "no");
 
   // Get frontend tools from CopilotKit state
-  // The architect uses CRUD tools to build structure + read tools to understand hierarchy
+  // The architect uses CRUD tools to build structure + read tools to understand hierarchy + approval tools
   const frontendActions = state.copilotkit?.actions ?? [];
   const architectTools = frontendActions.filter((action: { name: string }) =>
     [
+      // SNAPSHOT - Get full picture in ONE call (use FIRST!)
+      "getNodeTreeSnapshot",
+      // Plan approval (use after [PLAN READY])
+      "requestPlanApproval",
       // Edit mode management
       "requestEditMode",
       "releaseEditMode",
-      // Node creation
+      // Node creation - batchCreateNodes preferred for >3 nodes
+      "batchCreateNodes",
       "createNode",
       "getNodeTemplateFields",
-      // Structure understanding
+      // Structure understanding (use after snapshot for details)
       "getProjectHierarchyInfo",
       "getAvailableTemplates",
       "listAllNodeTemplates",
@@ -207,6 +351,49 @@ export async function architectNode(
 
   // Build context-aware system message
   let systemContent = ARCHITECT_SYSTEM_PROMPT;
+
+  // Add task context for continuity across context trimming
+  const taskContext = generateTaskContext(state);
+  if (taskContext) {
+    systemContent += `\n\n${taskContext}`;
+  }
+
+  // Add architect progress context (critical for maintaining continuity)
+  if (state.architectProgress) {
+    // CRITICAL: If nodes have been created, add strong guard against re-calling batch
+    if (state.architectProgress.nodesCreatedCount > 0) {
+      systemContent += `\n\n## CRITICAL: STRUCTURE ALREADY CREATED - DO NOT RE-CREATE
+
+**STOP! You have already created ${state.architectProgress.nodesCreatedCount} nodes via batchCreateNodes.**
+
+The following tempIds have been mapped to real nodeIds:
+${Object.entries(state.architectProgress.tempIdToNodeId).slice(-30).map(([tempId, nodeId]) => `- ${tempId} → ${nodeId}`).join("\n")}
+
+**DO NOT call batchCreateNodes again.** The course structure is already built.
+If you need to add individual nodes, use createNode instead.
+If structure is complete, report success to the user.`;
+    } else {
+      systemContent += `\n\n## Your Previous Progress (DO NOT REPEAT THESE STEPS)
+
+**Current Workflow Phase**: ${state.architectProgress.workflow}
+**Nodes Created So Far**: ${state.architectProgress.nodesCreatedCount}
+**Nodes Explored**: ${state.architectProgress.exploredNodes.length > 0 
+  ? state.architectProgress.exploredNodes.slice(-10).join(", ") 
+  : "None yet"}
+
+**TempId to NodeId Mappings** (use nodeId for parentNodeId):
+${Object.entries(state.architectProgress.tempIdToNodeId).slice(-20).map(([tempId, nodeId]) => `- ${tempId} → ${nodeId}`).join("\n") || "(none yet)"}
+
+**Recent Actions Taken**:
+${state.architectProgress.toolCallSummary.slice(-10).map(s => `- ${s}`).join("\n") || "No actions recorded yet"}
+
+${state.architectProgress.hierarchyCache ? `**Cached Hierarchy Info**:
+- Levels: ${state.architectProgress.hierarchyCache.levelNames.join(" > ")}
+- Max Depth: ${state.architectProgress.hierarchyCache.maxDepth}` : ""}
+
+**IMPORTANT**: You already have context from previous invocations. Continue from where you left off - do NOT re-explore structure you've already discovered.`;
+    }
+  }
 
   // Include project brief
   if (state.projectBrief) {
@@ -270,15 +457,52 @@ You may refine or extend this existing structure.`;
     ? architectModel.bindTools(architectTools)
     : architectModel;
 
-  // Filter messages for this agent's context - filter orphans first, then slice
-  // Filter AFTER slicing - slicing can create new orphans by removing AI messages with tool_use
-  const slicedMessages = (state.messages || []).slice(-12);
-  const recentMessages = filterOrphanedToolResults(slicedMessages, "[architect]");
+  // USE ARCHITECT-SPECIFIC MESSAGE CHANNEL
+  // This is the key change - read from architectMessages instead of slicing state.messages
+  // This preserves the architect's conversation history across orchestrator round-trips
+  let architectConversation: BaseMessage[] = [];
+  
+  if (state.architectMessages && state.architectMessages.length > 0) {
+    // Use architect's own message channel (already filtered and maintained)
+    // CRITICAL: Must call both filterOrphanedToolResults AND repairDanglingToolCalls
+    // to ensure proper tool_use/tool_result pairing for Claude API
+    let filtered = filterOrphanedToolResults(state.architectMessages, "[architect]");
+    architectConversation = repairDanglingToolCalls(filtered, "[architect]");
+    console.log(`  Using ${architectConversation.length} messages from architectMessages channel`);
+  } else {
+    // First invocation or fresh start - use processed messages from main channel
+    architectConversation = await processContext(state.messages || [], {
+      maxTokens: TOKEN_LIMITS.subAgent,
+      fallbackMessageCount: 40, // Increased from 12 to prevent context loss
+      // Compression: Reduce verbose tool results (getAvailableTemplates, etc.)
+      enableToolCompression: true,
+      compressionKeepCount: 3,        // Keep 3 most recent results full
+      compressionMaxLength: 800,      // Compress results over 800 chars
+      // Clearing: Replace very old tool results
+      enableToolClearing: true,
+      toolKeepCount: 8,               // Keep 8 most recent tool results
+      excludeTools: [                 // Never clear these critical tools
+        'getProjectHierarchyInfo',
+        'getAvailableTemplates',
+        'createNode',
+        'batchCreateNodes',          // Critical for tracking created nodes
+      ],
+      logPrefix: "[architect]",
+      // Task preservation - include batch keywords to prevent re-execution
+      originalRequest: state.activeTask?.originalRequest,
+      preserveKeywords: [
+        "structure", "section", "topic", "content block", "hierarchy",
+        "batchCreateNodes", "tempIdToNodeId", "nodesCreatedCount", "completedTempIds",
+        "Successfully created", "DO NOT call batchCreateNodes again",
+      ],
+    });
+    console.log(`  First invocation - using ${architectConversation.length} messages from main channel`);
+  }
 
   console.log("  Invoking architect model...");
 
   let response = await modelWithTools.invoke(
-    [systemMessage, ...recentMessages],
+    [systemMessage, ...architectConversation],
     config
   );
 
@@ -305,7 +529,7 @@ The user is waiting for you to build the course structure.`,
 
     console.log("  [RETRY] Re-invoking with nudge...");
     response = await modelWithTools.invoke(
-      [systemMessage, ...recentMessages, nudgeMessage],
+      [systemMessage, ...architectConversation, nudgeMessage],
       config
     );
     
@@ -402,6 +626,145 @@ The user is waiting for you to build the course structure.`,
     }
   }
 
+  // Build progress update for activeTask
+  const progressUpdates: string[] = [];
+  const toolCallSummaries: string[] = [];
+  const toolCalls = aiResponse.tool_calls || [];
+  
+  // Track tool calls for architectProgress
+  const createNodeCalls = toolCalls.filter(tc => tc.name === "createNode");
+  const batchCreateCalls = toolCalls.filter(tc => tc.name === "batchCreateNodes");
+  const navigationCalls = toolCalls.filter(tc => 
+    ["getNodesByLevel", "getNodeChildren", "getNodeDetails", "getAvailableTemplates", "getProjectHierarchyInfo"].includes(tc.name)
+  );
+  
+  // Track batch creation results from previous tool messages
+  let batchCreatedCount = 0;
+  const batchTempIdMappings: Record<string, string> = {};
+  
+  // Look for batchCreateNodes results in recent messages (tool_result messages)
+  const allMessages = state.architectMessages || state.messages || [];
+  for (const msg of allMessages) {
+    const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+    
+    // Look for batchCreateNodes success pattern
+    if (content.includes("tempIdToNodeId") || content.includes("nodesCreatedCount") || content.includes("completedTempIds")) {
+      try {
+        // Try to parse JSON from the content
+        const jsonMatch = content.match(/\{[\s\S]*"tempIdToNodeId"[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (parsed.tempIdToNodeId && typeof parsed.tempIdToNodeId === "object") {
+            Object.assign(batchTempIdMappings, parsed.tempIdToNodeId);
+            batchCreatedCount = Math.max(batchCreatedCount, parsed.nodesCreatedCount || Object.keys(parsed.tempIdToNodeId).length);
+            console.log(`  [architect] Found batch result: ${Object.keys(parsed.tempIdToNodeId).length} mappings`);
+          }
+        }
+      } catch {
+        // JSON parsing failed, try regex extraction
+        const mappingMatches = content.matchAll(/"([^"]+)"\s*:\s*"([0-9a-f-]+)"/g);
+        for (const match of mappingMatches) {
+          if (match[1].startsWith("temp-") || match[1].includes("-")) {
+            batchTempIdMappings[match[1]] = match[2];
+            batchCreatedCount++;
+          }
+        }
+      }
+    }
+  }
+  
+  if (createNodeCalls.length > 0) {
+    for (const tc of createNodeCalls) {
+      toolCallSummaries.push(`Created node: ${tc.args?.title || "untitled"}`);
+    }
+  }
+  if (batchCreateCalls.length > 0) {
+    toolCallSummaries.push(`Called batchCreateNodes`);
+  }
+  if (batchCreatedCount > 0) {
+    toolCallSummaries.push(`Batch created ${batchCreatedCount} nodes (mappings recorded)`);
+  }
+  if (navigationCalls.length > 0) {
+    for (const tc of navigationCalls) {
+      toolCallSummaries.push(`Called ${tc.name}${tc.args?.nodeId ? ` on ${String(tc.args.nodeId).substring(0, 8)}...` : ""}`);
+    }
+  }
+  
+  // Extract explored node IDs from navigation tool calls
+  const exploredNodeIds: string[] = [];
+  for (const tc of toolCalls) {
+    if (tc.args?.nodeId && typeof tc.args.nodeId === "string") {
+      exploredNodeIds.push(tc.args.nodeId);
+    }
+    if (tc.args?.parentNodeId && typeof tc.args.parentNodeId === "string") {
+      exploredNodeIds.push(tc.args.parentNodeId);
+    }
+  }
+
+  if (parsedPlannedStructure) {
+    progressUpdates.push(`Architect: Created plan for ${parsedPlannedStructure.nodes.length} nodes`);
+  }
+  if (newCreatedNodes.length > 0) {
+    progressUpdates.push(`Architect: Created ${newCreatedNodes.length} structural nodes`);
+  }
+  if (updatedPlannedStructure?.executionStatus === "completed") {
+    progressUpdates.push("Architect: Completed course structure creation");
+  }
+  if (parsedStructure) {
+    progressUpdates.push(`Architect: Finalized structure with ${parsedStructure.totalNodes} total nodes`);
+  }
+
+  // Determine workflow phase based on state
+  let workflowPhase: ArchitectProgress["workflow"] = state.architectProgress?.workflow || "planning";
+  if (isPlanReady) {
+    workflowPhase = "awaiting_approval";
+  } else if (createNodeCalls.length > 0 || batchCreateCalls.length > 0 || newCreatedNodes.length > 0 || batchCreatedCount > 0) {
+    workflowPhase = "building";
+  } else if (isStructureComplete || batchCreatedCount > 0) {
+    // If we have batch created nodes, we're likely complete
+    workflowPhase = "complete";
+  }
+
+  // Build tempId -> nodeId mappings from newly created nodes
+  const newTempIdMappings: Record<string, string> = {
+    ...batchTempIdMappings, // Include mappings from batch tool results
+  };
+  for (const created of newCreatedNodes) {
+    // Match by title to find the tempId
+    const matchingPlanned = state.plannedStructure?.nodes.find(
+      n => n.title.toLowerCase() === created.title.toLowerCase()
+    );
+    if (matchingPlanned) {
+      newTempIdMappings[matchingPlanned.tempId] = created.nodeId;
+    }
+  }
+
+  // Calculate total nodes created (individual + batch)
+  const totalNodesCreated = newCreatedNodes.length + batchCreatedCount;
+
+  // Build architectProgress update
+  const architectProgressUpdate: ArchitectProgress = {
+    workflow: workflowPhase,
+    exploredNodes: exploredNodeIds,
+    toolCallSummary: toolCallSummaries,
+    tempIdToNodeId: newTempIdMappings,
+    nodesCreatedCount: totalNodesCreated,
+    hierarchyCache: state.architectProgress?.hierarchyCache,
+    lastUpdated: new Date().toISOString(),
+  };
+
+  // Determine if work is complete
+  const isArchitectComplete = parsedStructure !== null || 
+    (updatedPlannedStructure?.executionStatus === "completed");
+
+  // Update activeTask with progress if there are updates
+  const activeTaskUpdate: Partial<ActiveTask> | null = progressUpdates.length > 0
+    ? {
+        progress: progressUpdates,
+        ...(isArchitectComplete && { assignedAgent: "orchestrator" as const }),
+      }
+    : null;
+
   return {
     messages: [response],
     currentAgent: "architect",
@@ -415,6 +778,12 @@ The user is waiting for you to build the course structure.`,
     ...(parsedStructure && { courseStructure: parsedStructure }),
     // Include new created nodes
     ...(newCreatedNodes.length > 0 && { createdNodes: newCreatedNodes }),
+    // Update activeTask with progress (reducer will merge with existing progress)
+    ...(activeTaskUpdate && { activeTask: activeTaskUpdate as ActiveTask }),
+    // CRITICAL: Append to architect's own message channel for continuity
+    architectMessages: [response],
+    // Update architect progress state for semantic context
+    architectProgress: architectProgressUpdate,
   };
 }
 

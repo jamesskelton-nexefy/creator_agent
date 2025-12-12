@@ -611,9 +611,43 @@ The user already made their choice. Execute it.
 - If unsure, ask the user for clarification using the tools (and WAIT for their response)
 - **Never auto-route to sub-agents** - always wait for user direction
 
-## Current Context Summary
+## CRITICAL: Simple Greeting Handling
 
-This section will be updated with the current state of agent outputs.`;
+When the user sends a SIMPLE GREETING without a specific request:
+- "Hello", "Hi", "Hey", "Good morning", "What's up", etc.
+
+**DO:**
+- Respond with a brief, friendly greeting
+- Mention the project name FROM THE CONTEXT you already have (check "Current Project Context" below)
+- Ask how you can help
+
+**DO NOT:**
+- Call getCurrentProject (the context already tells you the project!)
+- Call listProjects
+- Call offerOptions or askClarifyingQuestions
+- Make ANY tool calls at all for simple greetings
+
+**Example Response:**
+User: "Hello"
+You respond directly (no tools): "Hello! I see you're working on [project name from context]. What would you like to do today?"
+
+## CRITICAL: Use Context BEFORE Calling Tools
+
+The CopilotKit context section below ALREADY provides:
+- **Current Project**: The project the user is currently viewing
+- **Selected Node**: The currently selected node
+- **Project Stats**: Node counts and hierarchy info
+
+**CHECK THESE VALUES FIRST.** Only call tools when:
+1. The context doesn't have the information you need
+2. You need to perform an ACTION (not just read data)
+3. You need real-time/fresh data that context might not have
+
+**DO NOT call getCurrentProject if "Current Project Context" below already shows the project info!**
+
+## Current Project Context
+
+(This section is dynamically populated with context from the frontend)`;
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -660,6 +694,128 @@ function extractOriginalRequest(messages: BaseMessage[]): string {
   }
 
   return "No user request found";
+}
+
+/**
+ * Deduplicates messages to prevent issues from:
+ * 1. Graph iterations adding duplicate tool calls
+ * 2. Cloud checkpointing causing message replay
+ * 3. Interrupted streaming leaving orphan tool messages
+ * 
+ * This is critical for LangGraph Cloud where checkpointing behavior
+ * can cause tool calls to be processed multiple times.
+ */
+function deduplicateAndCleanMessages(messages: BaseMessage[]): BaseMessage[] {
+  const seenToolCallIds = new Set<string>();
+  const seenToolResultIds = new Set<string>();
+  let removedCount = 0;
+  
+  const cleaned = messages.filter((msg) => {
+    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
+    
+    // Filter out cancelled/interrupted tool messages
+    if (msgType === "tool" || msgType === "ToolMessage") {
+      const content = String((msg as any).content || "");
+      if (content.includes("[Tool call cancelled or interrupted")) {
+        removedCount++;
+        return false;
+      }
+      
+      // Check for duplicate tool results (same tool_call_id)
+      const toolCallId = (msg as any).tool_call_id;
+      if (toolCallId) {
+        if (seenToolResultIds.has(toolCallId)) {
+          removedCount++;
+          return false;
+        }
+        seenToolResultIds.add(toolCallId);
+      }
+    }
+    
+    // For AIMessages with tool_calls, check for duplicates
+    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
+      const toolCalls = (msg as any).tool_calls || [];
+      if (toolCalls.length > 0) {
+        // Check if ALL tool calls in this message were already seen
+        const allDuplicates = toolCalls.every((tc: any) => tc.id && seenToolCallIds.has(tc.id));
+        if (allDuplicates) {
+          removedCount++;
+          return false;
+        }
+        // Mark tool call IDs as seen
+        for (const tc of toolCalls) {
+          if (tc.id) seenToolCallIds.add(tc.id);
+        }
+      }
+    }
+    
+    return true;
+  });
+  
+  if (removedCount > 0) {
+    console.log(`  [dedup] Removed ${removedCount} duplicate/cancelled messages`);
+  }
+  
+  return cleaned;
+}
+
+/**
+ * Extracts key context values from CopilotKit state to inject into the system prompt.
+ * This makes context explicitly available to the LLM so it doesn't need to call tools
+ * to get information that's already present.
+ */
+function extractContextSummary(state: OrchestratorState): string {
+  const contextValues = (state as any).copilotkit?.context || [];
+  const summaryParts: string[] = [];
+  
+  for (const ctx of contextValues) {
+    try {
+      const desc = ctx.description || "";
+      const rawValue = ctx.value;
+      
+      // Skip null/empty values
+      if (!rawValue || rawValue === "null") continue;
+      
+      const value = typeof rawValue === "string" ? JSON.parse(rawValue) : rawValue;
+      
+      // Extract current project info
+      if (desc.includes("current project") && value?.name) {
+        summaryParts.push(`- **Current Project**: "${value.name}" (ID: ${value.id?.slice(0, 8)}...)`);
+        if (value.description) {
+          summaryParts.push(`  Description: ${value.description}`);
+        }
+      }
+      
+      // Extract selected node info
+      if (desc.includes("currently selected node") && value?.title) {
+        summaryParts.push(`- **Selected Node**: "${value.title}" (Level ${value.hierarchyLevel}, Type: ${value.nodeType})`);
+      }
+      
+      // Extract project stats
+      if (desc.includes("node tree") && typeof value?.totalNodes === "number") {
+        summaryParts.push(`- **Project Stats**: ${value.totalNodes} total nodes, max depth ${value.maxDepth}`);
+      }
+      
+      // Extract view mode
+      if (desc.includes("view mode") && typeof value === "string") {
+        summaryParts.push(`- **Current View**: ${value}`);
+      }
+      
+    } catch {
+      // Skip unparseable context - don't log to avoid noise
+    }
+  }
+  
+  if (summaryParts.length > 0) {
+    return `\n## Current Project Context (from CopilotKit - DO NOT re-fetch this!)
+
+${summaryParts.join("\n")}
+
+**NOTE**: This info is ALREADY available. Do NOT call getCurrentProject() or similar tools just to read this data.
+`;
+  }
+  
+  return "\n## Current Project Context\n\nNo project context available - user may be on the projects list page.\n";
 }
 
 /**
@@ -802,13 +958,21 @@ async function supervisorNode(
 ): Promise<Command> {
   console.log("\n[supervisor] ============ Supervisor Agent ============");
   console.log("  Agent context:", summarizeAgentContext(state));
-  console.log("  Messages count:", state.messages?.length ?? 0);
+  
+  // STEP 1: Deduplicate and clean messages BEFORE any processing
+  // This handles issues from LangGraph Cloud where:
+  // - Graph iterations add duplicate tool calls
+  // - Checkpointing causes message replay
+  // - Interrupted streaming leaves orphan "cancelled" messages
+  const rawMessages = state.messages || [];
+  const messages = deduplicateAndCleanMessages(rawMessages);
+  
+  console.log(`  Messages: ${rawMessages.length} raw -> ${messages.length} after dedup`);
   console.log("  Current agent:", state.currentAgent);
   console.log("  Agent history:", state.agentHistory?.join(" -> ") || "none");
 
   // SAFETY CHECK: Detect if the last message is an AIMessage with pending tool_calls
   // If so, we're waiting for CopilotKit to send the tool_result - don't invoke LLM
-  const messages = state.messages || [];
   if (messages.length > 0) {
     const lastMsg = messages[messages.length - 1];
     const lastMsgType = (lastMsg as any)._getType?.() || (lastMsg as any).constructor?.name || "";
@@ -885,6 +1049,12 @@ async function supervisorNode(
 
   // Build dynamic system prompt with context
   let systemContent = ORCHESTRATOR_SYSTEM_PROMPT;
+
+  // CRITICAL: Inject CopilotKit context summary into system prompt
+  // This makes project/node context explicitly available so the agent
+  // doesn't need to call getCurrentProject for simple greetings
+  const contextSummary = extractContextSummary(state);
+  systemContent += contextSummary;
 
   // Add active task context (most important - what we're currently working on)
   if (state.activeTask) {

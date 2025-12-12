@@ -755,19 +755,25 @@ ${cacheEntries.map(([nodeId, data]) =>
   
   if (state.builderMessages && state.builderMessages.length > 0) {
     // Use builder's own message channel (already filtered and maintained)
-    // CRITICAL: Must deduplicate tool_use IDs first - accumulated messages can have duplicates
-    // Then filter orphaned results and repair dangling tool calls
+    // CRITICAL processing pipeline for Anthropic API compatibility:
+    // 1. Deduplicate tool_use IDs (accumulated messages can have duplicates)
+    // 2. Filter orphaned tool_results (not adjacent to their tool_use)
+    // 3. Repair dangling tool_calls (add synthetic results)
+    // 4. Enforce strict ordering (ensure every tool_use has result immediately after)
     let deduplicated = deduplicateToolUseIds(state.builderMessages, "[builder-agent]");
     let filtered = filterOrphanedToolResults(deduplicated, "[builder-agent]");
-    builderConversation = repairDanglingToolCalls(filtered, "[builder-agent]");
+    let repaired = repairDanglingToolCalls(filtered, "[builder-agent]");
+    builderConversation = enforceToolResultOrdering(repaired, "[builder-agent]");
     console.log(`  Using ${builderConversation.length} messages from builderMessages channel (from ${state.builderMessages.length})`);
   } else {
     // First invocation or fresh start - use recent messages from main channel
     const strippedMessages = stripThinkingBlocks(state.messages || []);
     const slicedMessages = strippedMessages.slice(-15);
-    // Also deduplicate in case main channel has duplicates
+    // Also apply full processing pipeline for safety
     let deduplicated = deduplicateToolUseIds(slicedMessages, "[builder-agent]");
-    builderConversation = filterOrphanedToolResults(deduplicated, "[builder-agent]");
+    let filtered = filterOrphanedToolResults(deduplicated, "[builder-agent]");
+    let repaired = repairDanglingToolCalls(filtered, "[builder-agent]");
+    builderConversation = enforceToolResultOrdering(repaired, "[builder-agent]");
     console.log(`  First invocation - using ${builderConversation.length} messages from main channel`);
   }
 

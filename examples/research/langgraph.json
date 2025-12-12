@@ -8,7 +8,7 @@
   "env": ".env",
   "store": {
     "index": {
-      "embed": "openai:text-embedding-3-small",
+      "embed": "./lib/embeddings.ts:embeddings",
       "dims": 1536,
       "fields": ["$"]
     },

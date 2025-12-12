@@ -20,6 +20,7 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
+import { copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
 import type { OrchestratorState, ProjectBrief, AgentWorkState, StrategistPhase, ActiveTask } from "../state/agent-state";
 import { STRATEGIST_PHASES, generateTaskContext } from "../state/agent-state";
 
@@ -335,9 +336,15 @@ Continue gathering any missing information or refine what's been captured.`;
 
   console.log("  Invoking strategist model...");
 
+  // Configure CopilotKit for proper tool emission (emits tool calls to frontend)
+  const customConfig = copilotkitCustomizeConfig(config, {
+    emitToolCalls: true,
+    emitMessages: true,
+  });
+
   let response = await modelWithTools.invoke(
     [systemMessage, ...recentMessages],
-    config
+    customConfig
   );
 
   console.log("  Strategist response received");
@@ -387,7 +394,7 @@ The user is waiting for your response.`,
     console.log("  [RETRY] Re-invoking with nudge...");
     response = await modelWithTools.invoke(
       [systemMessage, ...recentMessages, nudgeMessage],
-      config
+      customConfig
     );
     
     aiResponse = response as AIMessage;

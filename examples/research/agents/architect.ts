@@ -25,7 +25,8 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, CourseStructure, PlannedNode, PlannedStructure, CreatedNode, ActiveTask, ArchitectProgress } from "../state/agent-state";
+import { copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
+import type { OrchestratorState, CourseStructure, PlannedNode, PlannedStructure, CreatedNode, ActiveTask, ArchitectProgress, LXDStrategy, ContentBlockType, PedagogicalIntent, BloomsLevel } from "../state/agent-state";
 import { getCondensedBrief, getCondensedResearch, generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
@@ -122,12 +123,23 @@ Wait for the user's response. Only proceed to Phase 2 if they approve.
 
 ## PLAN OUTPUT FORMAT
 
-Before creating ANY nodes, output your complete plan covering ALL levels down to Content Block:
+Before creating ANY nodes, output your complete plan covering ALL levels down to Content Block. Include LXD metadata for pedagogically-informed structure:
 
 \`\`\`json
 {
   "summary": "Brief description of the course structure",
   "rationale": "Why this structure works for the learning objectives",
+  "lxdStrategy": {
+    "objectiveMapping": {
+      "Understand financial risk types": ["sec-1", "topic-1-1"],
+      "Apply risk assessment techniques": ["sec-2"]
+    },
+    "bloomsLevels": ["remember", "understand", "apply"],
+    "assessmentApproach": "Formative Question Blocks after each topic, summative at section ends",
+    "engagementPattern": "Intro-explore-practice-assess cycle per topic",
+    "targetAudienceAdaptations": "Practical examples for business professionals, moderate complexity",
+    "estimatedDuration": "45-60 minutes"
+  },
   "nodes": [
     {
       "tempId": "sec-1",
@@ -171,17 +183,77 @@ Before creating ANY nodes, output your complete plan covering ALL levels down to
       "nodeType": "content_block",
       "level": 6,
       "parentTempId": "cg-1-1-1-1",
-      "description": "Opening content block - Writer will fill with actual text",
+      "description": "Opening content block - sets expectations",
+      "contentBlockType": "title_block",
+      "pedagogicalIntent": "engage",
+      "bloomsLevel": "remember",
+      "linkedObjectives": ["Understand financial risk types"],
       "orderIndex": 0
     },
     {
       "tempId": "cb-1-1-1-1-2",
-      "title": "Key Financial Risk Examples",
+      "title": "What You'll Learn",
       "nodeType": "content_block",
       "level": 6,
       "parentTempId": "cg-1-1-1-1",
-      "description": "Examples and scenarios - Writer will fill",
+      "description": "Learning objectives overview",
+      "contentBlockType": "information_block",
+      "pedagogicalIntent": "inform",
+      "bloomsLevel": "remember",
+      "linkedObjectives": ["Understand financial risk types"],
       "orderIndex": 1
+    },
+    {
+      "tempId": "cb-1-1-1-1-3",
+      "title": "Types of Financial Risk Explained",
+      "nodeType": "content_block",
+      "level": 6,
+      "parentTempId": "cg-1-1-1-1",
+      "description": "Core content explaining risk categories",
+      "contentBlockType": "text_block",
+      "pedagogicalIntent": "inform",
+      "bloomsLevel": "understand",
+      "linkedObjectives": ["Understand financial risk types"],
+      "orderIndex": 2
+    },
+    {
+      "tempId": "cb-1-1-1-1-4",
+      "title": "Risk Categories Comparison",
+      "nodeType": "content_block",
+      "level": 6,
+      "parentTempId": "cg-1-1-1-1",
+      "description": "Visual comparison of different risk types",
+      "contentBlockType": "three_images_block",
+      "pedagogicalIntent": "demonstrate",
+      "bloomsLevel": "understand",
+      "linkedObjectives": ["Understand financial risk types"],
+      "orderIndex": 3
+    },
+    {
+      "tempId": "cb-1-1-1-1-5",
+      "title": "Check Your Understanding",
+      "nodeType": "content_block",
+      "level": 6,
+      "parentTempId": "cg-1-1-1-1",
+      "description": "Formative assessment question",
+      "contentBlockType": "question_block",
+      "pedagogicalIntent": "assess",
+      "bloomsLevel": "understand",
+      "linkedObjectives": ["Understand financial risk types"],
+      "orderIndex": 4
+    },
+    {
+      "tempId": "cb-1-1-1-1-6",
+      "title": "Key Takeaways",
+      "nodeType": "content_block",
+      "level": 6,
+      "parentTempId": "cg-1-1-1-1",
+      "description": "Summary of main points",
+      "contentBlockType": "information_block",
+      "pedagogicalIntent": "summarize",
+      "bloomsLevel": "remember",
+      "linkedObjectives": ["Understand financial risk types"],
+      "orderIndex": 5
     }
   ]
 }
@@ -228,6 +300,125 @@ If you see existing plannedStructure or createdNodes in the context:
 3. **Logical Flow** - Each level should progress naturally
 4. **Clear Naming** - Descriptive titles that indicate content
 5. **Balanced Depth** - Don't go deeper than necessary
+
+## LXD (Learning Experience Design) Principles
+
+Apply these pedagogical principles when planning course structure:
+
+**Core LXD Principles:**
+1. **Objective Alignment** - Map content blocks to learning objectives from the Project Brief. Every section should trace back to at least one objective from \`projectBrief.objectives\`.
+2. **Cognitive Load Management** - Break complex topics into digestible chunks (7±2 rule). Don't overload Content Groups with too many blocks.
+3. **Multimodal Learning** - Combine text, visuals, video, and interactivity for better retention. Vary content block types within each Content Group.
+4. **Active Learning** - Include Question Blocks and Action Blocks for practice, reflection, and application. Don't make it all passive reading.
+5. **Spaced Repetition** - Distribute key concepts throughout the structure. Revisit important ideas in different contexts.
+6. **Feedback Loops** - Place Question Blocks (formative assessments) after introducing new concepts to check understanding.
+7. **Scaffolding Sequence** - Progress from awareness → understanding → application → mastery within each topic.
+
+**Learning Theory Integration:**
+- **Bloom's Taxonomy**: Tag content blocks with cognitive level (remember, understand, apply, analyze, evaluate, create)
+- **ARCS Model**: Ensure structure supports Attention, Relevance, Confidence, Satisfaction
+- **Gagné's Events**: Structure topics to gain attention → inform objectives → stimulate recall → present content → provide guidance → elicit performance → provide feedback → assess → enhance retention
+
+**Using State Context for LXD Decisions:**
+When planning structure, actively reference:
+- \`projectBrief.objectives\` - Map each section/topic to specific objectives
+- \`projectBrief.targetAudience\` - Tailor complexity and engagement style
+- \`researchFindings.keyTopics\` with importance levels - Allocate more content blocks to "critical" topics
+- \`researchFindings.bestPractices\` - Incorporate into content design
+- \`projectBrief.constraints\` - Consider time/technical limitations when selecting block types
+
+## Content Block Selection Guide
+
+Select the appropriate content block type based on pedagogical intent. There are 10 content block templates available:
+
+**Introduction & Engagement:**
+- **Title Block** - Course/section openings, set expectations, attention-grabbing headers
+- **Image Banner Block** - Visual impact, establish context, create atmosphere
+
+**Information Delivery:**
+- **Text Block** - Core concepts, definitions, explanations, detailed content
+- **Information Block** - Key points, warnings, tips, insights (use icon colors: Lightbulb/Blue for tips, Tick/Green for success, Cross/Red for warnings, Important/Orange for cautions)
+- **Video Block** - Demonstrations, storytelling, expert interviews, complex procedures
+- **Three Images Block** - Comparisons, processes, visual examples, before/after
+- **Animation Block** - Sequential information, step-by-step processes, carousels
+
+**Engagement & Interaction:**
+- **Text and Images Block** - Prompted reflection, downloadable resources, call-to-action content
+- **Question Block** - Knowledge checks, scenario-based questions (2 or 4 answer options)
+- **Action Block** - Practice activities, real-world application prompts, navigation
+
+**Assessment Strategy:**
+- **Formative** - Place Question Blocks throughout (after every 3-5 content blocks) to check understanding
+- **Summative** - Use Question Block sequences at section ends for comprehensive assessment
+
+**Bloom's Taxonomy Mapping:**
+| Bloom's Level | Recommended Block Types |
+|---------------|------------------------|
+| Remember | Text Block (definitions), Information Block (key facts), Question Block (recall) |
+| Understand | Text Block (explanations), Video Block (demonstrations), Three Images Block (comparisons) |
+| Apply | Question Block (scenarios), Action Block (practice), Text and Images Block (examples) |
+| Analyze | Question Block (analysis), Text Block (breakdowns), Animation Block (processes) |
+| Evaluate | Question Block (judgment), Action Block (decisions) |
+| Create | Action Block (projects), Text and Images Block (synthesis tasks) |
+
+## Planning Heuristics - Content Block Patterns
+
+Use these proven patterns when structuring Content Groups:
+
+**Topic Introduction Pattern (5-7 blocks):**
+1. Title Block - Set expectations, topic name
+2. Information Block (Lightbulb/Blue) - "What you'll learn" objectives
+3. Text Block or Video Block - Core concept introduction
+4. Three Images Block or Animation Block - Visual explanation
+5. Question Block - Quick knowledge check (formative)
+6. Text and Images Block - Real-world example with CTA
+7. Information Block (Tick/Green) - Key takeaway summary
+
+**Complex Concept Pattern (8-10 blocks):**
+1. Title Block - Topic name
+2. Information Block (Important/Orange) - Prerequisite check or warning
+3. Text Block - Overview and context
+4. Animation Block or Three Images Block - Break down into steps
+5. Video Block - Detailed demonstration
+6. Text Block - Deep dive on each component
+7. Question Block - Check understanding (formative)
+8. Text and Images Block - Application scenario
+9. Action Block - Practice activity
+10. Information Block (Tick/Green) - Summary of key points
+
+**Assessment Pattern (3-5 blocks):**
+1. Information Block (Lightbulb/Blue) - Instructions and context
+2. Question Block - Question 1 (recall/understand level)
+3. Question Block - Question 2 (apply/analyze level)
+4. Question Block - Question 3 (higher complexity, optional)
+5. Action Block - Continue or review options
+
+**Quick Reference Pattern (3-4 blocks):**
+1. Title Block - Reference topic
+2. Information Block - Key points summary
+3. Text Block or Three Images Block - Quick reference content
+4. Action Block - Navigate to related content
+
+## Content Block Validation Rules
+
+Apply these quality checks when planning:
+
+**Content Block Diversity:**
+- Maximum 3 consecutive Text Blocks (avoid "wall of text")
+- At least 1 Question Block per 5-8 content blocks
+- Mix of media types (text, image, video) within each Content Group
+- Include Action Blocks for practice opportunities (at least 1 per major topic)
+
+**Cognitive Load:**
+- Content Groups should have 4-7 Content Blocks (not 15+)
+- Place Question Blocks after Video Blocks (check retention)
+- Use Information Blocks for emphasis (maximum 2-3 per Content Group)
+- Balance information delivery with interaction
+
+**Objective Coverage:**
+- Every learning objective from \`projectBrief.objectives\` should map to at least one section
+- Critical topics from \`researchFindings.keyTopics\` should have more content blocks than supplementary topics
+- Include at least one assessment opportunity per learning objective
 
 ## Node Creation Strategy
 
@@ -471,7 +662,7 @@ You may refine or extend this existing structure.`;
     console.log(`  Using ${architectConversation.length} messages from architectMessages channel`);
   } else {
     // First invocation or fresh start - use processed messages from main channel
-    architectConversation = await processContext(state.messages || [], {
+    const processResult = await processContext(state.messages || [], {
       maxTokens: TOKEN_LIMITS.subAgent,
       fallbackMessageCount: 40, // Increased from 12 to prevent context loss
       // Compression: Reduce verbose tool results (getAvailableTemplates, etc.)
@@ -496,14 +687,22 @@ You may refine or extend this existing structure.`;
         "Successfully created", "DO NOT call batchCreateNodes again",
       ],
     });
+    // Extract messages array from ProcessContextResult
+    architectConversation = processResult.messages;
     console.log(`  First invocation - using ${architectConversation.length} messages from main channel`);
   }
 
   console.log("  Invoking architect model...");
 
+  // Configure CopilotKit for proper tool emission (emits tool calls to frontend)
+  const customConfig = copilotkitCustomizeConfig(config, {
+    emitToolCalls: true,
+    emitMessages: true,
+  });
+
   let response = await modelWithTools.invoke(
     [systemMessage, ...architectConversation],
-    config
+    customConfig
   );
 
   console.log("  Architect response received");
@@ -530,7 +729,7 @@ The user is waiting for you to build the course structure.`,
     console.log("  [RETRY] Re-invoking with nudge...");
     response = await modelWithTools.invoke(
       [systemMessage, ...architectConversation, nudgeMessage],
-      config
+      customConfig
     );
     
     aiResponse = response as AIMessage;
@@ -828,6 +1027,11 @@ function validatePlannedNode(input: Partial<PlannedNode>, index: number): Planne
     description: input.description || "",
     objectives: input.objectives,
     orderIndex: input.orderIndex ?? index,
+    // LXD metadata fields (for Level 6 Content Block nodes)
+    contentBlockType: input.contentBlockType as ContentBlockType | undefined,
+    pedagogicalIntent: input.pedagogicalIntent as PedagogicalIntent | undefined,
+    bloomsLevel: input.bloomsLevel as BloomsLevel | undefined,
+    linkedObjectives: input.linkedObjectives,
   };
 }
 
@@ -843,6 +1047,19 @@ export function parsePlannedStructure(content: string): PlannedStructure | null 
       const parsed = JSON.parse(jsonMatch[1]);
       const nodes = (parsed.nodes || []).map((n: Partial<PlannedNode>, idx: number) => validatePlannedNode(n, idx));
       
+      // Parse LXD strategy if present
+      let lxdStrategy: LXDStrategy | undefined;
+      if (parsed.lxdStrategy) {
+        lxdStrategy = {
+          objectiveMapping: parsed.lxdStrategy.objectiveMapping || {},
+          bloomsLevels: parsed.lxdStrategy.bloomsLevels || [],
+          assessmentApproach: parsed.lxdStrategy.assessmentApproach || "",
+          engagementPattern: parsed.lxdStrategy.engagementPattern || "",
+          targetAudienceAdaptations: parsed.lxdStrategy.targetAudienceAdaptations || "",
+          estimatedDuration: parsed.lxdStrategy.estimatedDuration || "",
+        };
+      }
+      
       return {
         summary: parsed.summary || "Course structure plan",
         rationale: parsed.rationale || "",
@@ -852,6 +1069,7 @@ export function parsePlannedStructure(content: string): PlannedStructure | null 
         plannedAt: new Date().toISOString(),
         executionStatus: "planned",
         executedNodes: {},
+        lxdStrategy,
       };
     }
     return null;

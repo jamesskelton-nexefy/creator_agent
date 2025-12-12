@@ -42,8 +42,8 @@
   "dependencies": {
     "@ag-ui/client": "^0.0.41",
     "@anthropic-ai/sdk": "^0.71.0",
-    "@copilotkit/runtime": "^1.10.6",
-    "@copilotkit/sdk-js": "^1.10.6",
+    "@copilotkit/runtime": "^1.50.0",
+    "@copilotkit/sdk-js": "^1.50.0",
     "@langchain/anthropic": "^1.0.0",
     "@langchain/community": "^0.3.0",
     "@langchain/core": "^1.1.4",

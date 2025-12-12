@@ -23,7 +23,10 @@ import { START, StateGraph, END, Command } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
-import { copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
+import {
+  copilotkitCustomizeConfig,
+  copilotkitEmitState,
+} from "@copilotkit/sdk-js/langgraph";
 
 // State and agent imports
 import {
@@ -133,6 +136,87 @@ const TABLE_TOOLS_FOR_DATA_AGENT = new Set([
   "getTableDataSummary",
   "getFieldValueDistribution",
 ]);
+
+// ============================================================================
+// TOOL CLASSIFICATION SYSTEM
+// ============================================================================
+
+/**
+ * Backend tools - executed within LangGraph sub-agent subgraphs.
+ * These are NOT handled by supervisor directly - they run in sub-agents.
+ */
+const BACKEND_TOOL_NAMES = new Set([
+  "web_search",
+  "tavily_search",
+]);
+
+/**
+ * Internal routing tools - used by supervisor for agent delegation.
+ * These should NEVER be emitted to CopilotKit.
+ */
+const INTERNAL_ROUTING_TOOLS = new Set([
+  "supervisor_response",
+]);
+
+/**
+ * Gets CopilotKit frontend action names from state.
+ */
+function getCopilotKitActionNames(state: OrchestratorState): Set<string> {
+  const actions = state.copilotkit?.actions ?? [];
+  return new Set(actions.map((a: { name: string }) => a.name));
+}
+
+/**
+ * Tool call classification result.
+ */
+interface ClassifiedToolCalls {
+  backendToolCalls: Array<{ name: string; id?: string; args: any }>;
+  frontendToolCalls: Array<{ name: string; id?: string; args: any }>;
+  routingToolCalls: Array<{ name: string; id?: string; args: any }>;
+}
+
+/**
+ * Classifies tool calls by execution target.
+ * 
+ * Classification priority:
+ * 1. Internal routing tools (supervisor_response) -> routingToolCalls
+ * 2. Known backend tools (web_search, etc.) -> backendToolCalls
+ * 3. CopilotKit frontend actions -> frontendToolCalls
+ * 4. Unknown tools -> frontendToolCalls (safer default)
+ */
+function classifyToolCalls(
+  toolCalls: Array<{ name: string; id?: string; args: any }>,
+  state: OrchestratorState
+): ClassifiedToolCalls {
+  const copilotKitActions = getCopilotKitActionNames(state);
+  
+  const backendToolCalls: ClassifiedToolCalls["backendToolCalls"] = [];
+  const frontendToolCalls: ClassifiedToolCalls["frontendToolCalls"] = [];
+  const routingToolCalls: ClassifiedToolCalls["routingToolCalls"] = [];
+  
+  for (const toolCall of toolCalls) {
+    if (INTERNAL_ROUTING_TOOLS.has(toolCall.name)) {
+      routingToolCalls.push(toolCall);
+    } else if (BACKEND_TOOL_NAMES.has(toolCall.name)) {
+      backendToolCalls.push(toolCall);
+    } else if (copilotKitActions.has(toolCall.name)) {
+      frontendToolCalls.push(toolCall);
+    } else {
+      // Unknown tools default to frontend (safer - visible error vs silent failure)
+      console.warn(`  [classifyToolCalls] Unknown tool "${toolCall.name}" - treating as frontend`);
+      frontendToolCalls.push(toolCall);
+    }
+  }
+  
+  if (toolCalls.length > 0) {
+    console.log("  [classifyToolCalls] Results:");
+    console.log(`    Routing: ${routingToolCalls.map(t => t.name).join(", ") || "none"}`);
+    console.log(`    Backend: ${backendToolCalls.map(t => t.name).join(", ") || "none"}`);
+    console.log(`    Frontend: ${frontendToolCalls.map(t => t.name).join(", ") || "none"}`);
+  }
+  
+  return { backendToolCalls, frontendToolCalls, routingToolCalls };
+}
 
 // ============================================================================
 // SUPERVISOR ROUTING TOOL
@@ -620,6 +704,86 @@ function generateGoalForAgent(agent: AgentType, state: OrchestratorState, answer
 }
 
 // ============================================================================
+// COPILOTKIT HANDLER NODE
+// ============================================================================
+
+/**
+ * CopilotKit Handler Node
+ * 
+ * Handles frontend tool calls by:
+ * 1. Emitting tool calls to CopilotKit via AG-UI protocol
+ * 2. Keeping the graph run OPEN (routing back to supervisor)
+ * 3. Allowing the supervisor to receive tool results
+ * 
+ * CRITICAL: Routes to "supervisor", NOT to END.
+ * Routing to END causes orphaned tool calls - the tool result has nowhere to go.
+ * 
+ * Flow:
+ * - Supervisor detects frontend tool calls
+ * - Routes to copilotkit_handler with pendingFrontendActions
+ * - Handler emits tool calls to CopilotKit
+ * - Routes back to supervisor
+ * - Supervisor's safety check waits for tool results
+ * - Tool results flow back from CopilotKit
+ * - Supervisor processes results and responds
+ */
+async function copilotKitHandlerNode(
+  state: OrchestratorState,
+  config: RunnableConfig
+): Promise<Command> {
+  console.log("\n========================================");
+  console.log("[copilotkit_handler] Processing frontend tool calls");
+  console.log("========================================");
+  
+  try {
+    const pendingActions = state.pendingFrontendActions ?? [];
+    console.log(`  Pending frontend actions: ${pendingActions.length}`);
+    
+    if (pendingActions.length > 0) {
+      console.log(`  Actions: ${pendingActions.map(a => a.name).join(", ")}`);
+    }
+    
+    // Configure CopilotKit to emit tool calls
+    const modifiedConfig = copilotkitCustomizeConfig(config, {
+      emitToolCalls: true,
+      emitMessages: true,
+    });
+    
+    // Emit current state to CopilotKit
+    // This triggers the frontend to execute the pending tool calls
+    await copilotkitEmitState(modifiedConfig, state);
+    
+    console.log("  Tool calls emitted to CopilotKit");
+    console.log("  -> Routing to END to await tool results from CopilotKit");
+    
+    // CRITICAL: Route to END after emitting tool calls
+    // The graph run finishes, but CopilotKit has received the tool call info.
+    // CopilotKit will execute the frontend tool and send back a ToolMessage,
+    // which starts a new run where supervisor can process the result.
+    return new Command({
+      goto: END,
+      update: {
+        pendingFrontendActions: [],
+        currentAgent: "orchestrator" as AgentType,
+      },
+    });
+    
+  } catch (error) {
+    console.error("  [copilotkit_handler] Error:", error);
+    
+    // On error, still route to supervisor with error state
+    return new Command({
+      goto: "supervisor",
+      update: {
+        pendingFrontendActions: [],
+        currentAgent: "orchestrator" as AgentType,
+        lastError: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+}
+
+// ============================================================================
 // SUPERVISOR (ORCHESTRATOR) NODE - CopilotKit Supervisor Pattern
 // ============================================================================
 
@@ -665,9 +829,19 @@ async function supervisorNode(
         const unresolvedCalls = aiMsg.tool_calls.filter(tc => tc.id && !toolResultIds.has(tc.id));
         
         if (unresolvedCalls.length > 0) {
-          console.log(`  [SAFETY] Last message has ${unresolvedCalls.length} unresolved tool_calls: ${unresolvedCalls.map(tc => tc.name).join(", ")}`);
-          console.log("  [SAFETY] Waiting for tool_result from CopilotKit - skipping LLM invocation");
-          // Return Command to END - wait for CopilotKit to send tool_result
+          console.log(`  [SAFETY] ${unresolvedCalls.length} unresolved tool_calls: ${unresolvedCalls.map(tc => tc.name).join(", ")}`);
+          
+          // Classify unresolved calls for logging
+          const { frontendToolCalls } = classifyToolCalls(unresolvedCalls, state);
+          
+          if (frontendToolCalls.length > 0) {
+            console.log("  [SAFETY] Unresolved frontend tools - waiting for CopilotKit response");
+          }
+          
+          // Route to END to wait for tool results from CopilotKit
+          // If these are frontend tools, they've already been emitted by copilotkit_handler
+          // in a previous run. CopilotKit will send the ToolMessage to start a new run.
+          console.log("  [SAFETY] Routing to END - waiting for tool results");
           return new Command({
             goto: END,
             update: { currentAgent: "orchestrator" as AgentType },
@@ -841,9 +1015,19 @@ Consider starting with the Strategist to gather requirements.`;
 
   // Prepare messages with unified context management pipeline
   // Balanced context reduction - retain node/project info to prevent re-fetching loops
-  const filteredMessages = await processContext(state.messages || [], {
+  // NOTE: Skip summarization if we already have a summary - don't regenerate unnecessarily
+  const hasExistingSummary = !!state.conversationSummary;
+  if (hasExistingSummary) {
+    console.log("  [SUMMARY] Using existing summary from state (skipping regeneration)");
+  }
+  
+  const contextResult = await processContext(state.messages || [], {
     maxTokens: TOKEN_LIMITS.orchestrator,
     fallbackMessageCount: MESSAGE_LIMITS.orchestrator,
+    // CRITICAL: Strip large jsxCode from older generateCustomComponent calls
+    // This prevents state explosion from builder agent's component generation
+    enableToolArgStripping: true,
+    toolArgStripKeepCount: 3,       // Keep 3 most recent with full JSX
     // Compression: Reduce verbose tool results but keep more recent ones
     enableToolCompression: true,
     compressionKeepCount: 5,        // Increased from 2 - keep more full results
@@ -860,10 +1044,11 @@ Consider starting with the Strategist to gather requirements.`;
       'batchCreateNodes',            // Critical for tracking created nodes
       'createNode',                  // Track individual node creation
     ],
-    // Summarization: Less aggressive condensation
-    enableSummarization: true,
-    summarizeTriggerTokens: 25000,  // Increased from 15000 - trigger later
-    summarizeKeepMessages: 15,      // Increased from 8 - keep more messages
+    // Summarization: Only if we don't have an existing summary
+    // Once summarized, the summary persists in state and we don't regenerate
+    enableSummarization: !hasExistingSummary,
+    summarizeTriggerTokens: 100000, // Trigger at 100k tokens (very long conversations)
+    summarizeKeepMessages: 15,      // Keep 15 most recent messages after summarizing
     logPrefix: "[supervisor]",
     // Task preservation: Keep messages containing the original user request
     originalRequest: state.activeTask?.originalRequest,
@@ -875,14 +1060,44 @@ Consider starting with the Strategist to gather requirements.`;
     ],
   });
 
+  const filteredMessages = contextResult.messages;
+  // Use newly generated summary OR existing summary from state
+  const conversationSummary = contextResult.summary ?? state.conversationSummary;
+
   const customConfig = copilotkitCustomizeConfig(config, {
     emitToolCalls: true,
   });
 
   console.log("  Invoking supervisor model...");
 
+  // Build system message - include summary if we have one
+  // Anthropic only allows ONE SystemMessage at position 0, so we combine them
+  let finalSystemMessage: SystemMessage;
+  if (conversationSummary) {
+    console.log("  [SUMMARY] Including conversation summary in system prompt");
+    finalSystemMessage = new SystemMessage({
+      content: [
+        {
+          type: "text",
+          text: `[Previous Conversation Summary]\n${conversationSummary}\n\n---\n\n`,
+        },
+        {
+          type: "text",
+          text: ORCHESTRATOR_SYSTEM_PROMPT,
+          cache_control: { type: "ephemeral" },
+        },
+        {
+          type: "text",
+          text: systemContent.replace(ORCHESTRATOR_SYSTEM_PROMPT, ""),
+        },
+      ],
+    });
+  } else {
+    finalSystemMessage = systemMessage;
+  }
+
   const response = await modelWithTools.invoke(
-    [systemMessage, ...filteredMessages],
+    [finalSystemMessage, ...filteredMessages],
     customConfig
   );
 
@@ -962,6 +1177,7 @@ Consider starting with the Strategist to gather requirements.`;
             currentAgent: nextAgent as AgentType,
             agentHistory: [nextAgent as AgentType],
             activeTask: newActiveTask,
+            conversationSummary, // Persist summary in state
             ...writerStateClear,
           },
         });
@@ -983,18 +1199,33 @@ Consider starting with the Strategist to gather requirements.`;
         update: {
           messages: updatedMessages,
           currentAgent: "orchestrator" as AgentType,
+          conversationSummary, // Persist summary in state
           ...writerStateClearOnComplete,
         },
       });
     }
     
-    // CopilotKit frontend tool call (not supervisor_response) - route to END for CopilotKit to execute
-    console.log("  -> Routing to END (CopilotKit tool execution)");
+    // Classify tool calls for logging
+    const { frontendToolCalls } = classifyToolCalls(
+      aiResponse.tool_calls,
+      state
+    );
+
+    if (frontendToolCalls.length > 0) {
+      console.log(`  -> Frontend tools: ${frontendToolCalls.map(t => t.name).join(", ")}`);
+    }
+
+    // Route to END for frontend tool calls
+    // Tool calls are already emitted via copilotkitCustomizeConfig during LLM invocation
+    // CopilotKit will execute the frontend tool and send back a ToolMessage
+    // which starts a new run where supervisor processes the result
+    console.log("  -> Routing to END (waiting for tool results from CopilotKit)");
     return new Command({
       goto: END,
       update: {
         messages: updatedMessages,
         currentAgent: "orchestrator" as AgentType,
+        conversationSummary, // Persist summary in state
       },
     });
   }
@@ -1122,6 +1353,8 @@ const SUPERVISOR_ROUTING_DESTINATIONS = [
   "document_agent",
   "media_agent",
   "framework_agent",
+  // CopilotKit handler for frontend tool calls
+  "copilotkit_handler",
   // End (wait for user/CopilotKit)
   END,
 ];
@@ -1131,6 +1364,10 @@ const workflow = new StateGraph(OrchestratorStateAnnotation)
   .addNode("supervisor", supervisorNode, { 
     ends: SUPERVISOR_ROUTING_DESTINATIONS 
   })
+  
+  // CopilotKit handler for frontend tool calls
+  // Routes back to supervisor after emitting tool calls to keep run open
+  .addNode("copilotkit_handler", copilotKitHandlerNode)
   
   // Creative workflow subgraphs
   .addNode("strategist", strategistSubgraph)
@@ -1150,6 +1387,9 @@ const workflow = new StateGraph(OrchestratorStateAnnotation)
 
   // Entry point -> supervisor
   .addEdge(START, "supervisor")
+  
+  // CopilotKit handler routes back to supervisor to await tool results
+  .addEdge("copilotkit_handler", "supervisor")
 
   // Simple edges: sub-agents route back to supervisor after completion
   // Following CopilotKit supervisor pattern - no conditional edges needed
@@ -1165,6 +1405,78 @@ const workflow = new StateGraph(OrchestratorStateAnnotation)
   .addEdge("document_agent", "supervisor")
   .addEdge("media_agent", "supervisor")
   .addEdge("framework_agent", "supervisor");
+
+// ============================================================================
+// DEBUG UTILITIES
+// ============================================================================
+
+/**
+ * Debug utility: Logs the current state of tool calls in message history.
+ * Useful for debugging orphaned tool call issues.
+ */
+function debugToolCallState(messages: BaseMessage[], prefix: string = ""): void {
+  const toolCalls = new Map<string, { name: string; hasResult: boolean }>();
+  
+  for (const msg of messages) {
+    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
+    
+    if (msgType === "ai" || msgType === "AIMessage") {
+      for (const tc of (msg as AIMessage).tool_calls || []) {
+        if (tc.id) toolCalls.set(tc.id, { name: tc.name, hasResult: false });
+      }
+    }
+    
+    if (msgType === "tool" || msgType === "ToolMessage") {
+      const existing = toolCalls.get((msg as ToolMessage).tool_call_id);
+      if (existing) existing.hasResult = true;
+    }
+  }
+  
+  console.log(`${prefix}=== TOOL CALL STATE ===`);
+  if (toolCalls.size === 0) {
+    console.log(`${prefix}  No tool calls in history`);
+    return;
+  }
+  
+  for (const [id, state] of toolCalls) {
+    const status = state.hasResult ? "resolved" : "PENDING";
+    console.log(`${prefix}  ${state.name} (${id.slice(0, 8)}...): ${status}`);
+  }
+  
+  const pendingCount = [...toolCalls.values()].filter(tc => !tc.hasResult).length;
+  if (pendingCount > 0) {
+    console.log(`${prefix}  WARNING: ${pendingCount} pending tool call(s)!`);
+  }
+}
+
+/**
+ * Finds orphaned tool calls (calls without matching results).
+ * Returns array of orphaned tool call IDs.
+ */
+function findOrphanedToolCalls(messages: BaseMessage[]): string[] {
+  const toolCallIds = new Set<string>();
+  const toolResultIds = new Set<string>();
+  
+  for (const msg of messages) {
+    const msgType = (msg as any)._getType?.() || (msg as any).constructor?.name || "";
+    
+    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
+      for (const tc of (msg as AIMessage).tool_calls || []) {
+        if (tc.id) toolCallIds.add(tc.id);
+      }
+    }
+    
+    if (msgType === "tool" || msgType === "ToolMessage") {
+      toolResultIds.add((msg as ToolMessage).tool_call_id);
+    }
+  }
+  
+  // Find tool calls without results
+  return [...toolCallIds].filter(id => !toolResultIds.has(id));
+}
+
+// Export debug utilities for use in testing
+export { debugToolCallState, findOrphanedToolCalls };
 
 // ============================================================================
 // PERSISTENCE SETUP

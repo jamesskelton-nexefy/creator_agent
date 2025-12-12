@@ -43,14 +43,27 @@
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
-import { AIMessage, SystemMessage, HumanMessage } from "@langchain/core/messages";
+import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type { OrchestratorState, PreviewState, GeneratedPreview } from "../state/agent-state";
+import { copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
+import type { 
+  OrchestratorState, 
+  PreviewState, 
+  GeneratedPreview, 
+  GeneratedComponent,
+  BuilderProgress,
+  ContentBlockType,
+  PedagogicalIntent,
+  BloomsLevel,
+} from "../state/agent-state";
 import { generateTaskContext } from "../state/agent-state";
 
 // Centralized context management utilities
 import {
   filterOrphanedToolResults,
+  repairDanglingToolCalls,
+  deduplicateToolUseIds,
+  enforceToolResultOrdering,
   stripThinkingBlocks,
   hasUsableResponse,
 } from "../utils";
@@ -77,9 +90,12 @@ You are a **React component designer** who creates visually stunning e-learning 
 
 ## CRITICAL RULES
 
-### 1. You MUST Generate CODE via generateCustomComponent
+### 1. You MUST Generate CODE via generateCustomComponent or batchGenerateComponents
 
-**generateCustomComponent is your ONLY tool for creating previews.** You write complete React component code that renders in a browser sandbox. Do NOT look for or try to use other preview tools - they don't exist for you.
+- **generateCustomComponent** - For single node previews
+- **batchGenerateComponents** - For multiple nodes at once (more efficient)
+
+You write complete React component code that renders in a browser sandbox.
 
 ### 2. Your Code Must Define a Named Component
 
@@ -105,8 +121,8 @@ Your code gives you full creative control over:
 
 ## Your Tools
 
-### PRIMARY (REQUIRED for preview generation)
-1. **generateCustomComponent** - Generate custom JSX code for sandbox preview
+### COMPONENT GENERATION (Required for previews)
+1. **generateCustomComponent** - Generate JSX code for a SINGLE node
    - Parameters:
      - nodeId: string - The content node ID
      - baseType: string - Base component type (TitleBlock, TextBlock, QuestionBlock, etc.)
@@ -114,27 +130,34 @@ Your code gives you full creative control over:
      - jsxCode: string - Your generated JSX code (MUST define a component)
      - animationConfig?: object - Framer Motion animation settings
 
+2. **batchGenerateComponents** - Generate previews for MULTIPLE nodes at once (PREFERRED for >3 nodes)
+   - Parameters:
+     - components: array of { nodeId, baseType, variant, jsxCode, animationConfig }
+     - scope?: { parentNodeId: string } - Optional: generate for all Content Blocks under this parent
+   - Use this when generating previews for an entire module/section
+   - Much more efficient than calling generateCustomComponent multiple times
+
 ### Preview Control
-2. **previewInDevice** - Preview at specific device size
+3. **previewInDevice** - Preview at specific device size
    - Parameters: (nodeId: string, device: "desktop" | "tablet" | "mobile")
 
-3. **setPreviewMode** - Switch display mode
+4. **setPreviewMode** - Switch display mode
    - Parameters: (mode: "single" | "flow")
 
-4. **selectPreviewNode** - Select node to preview
+5. **selectPreviewNode** - Select node to preview
    - Parameters: (nodeId: string)
 
-5. **switchViewMode** - Switch to preview view
+6. **switchViewMode** - Switch to preview view
    - Parameters: (mode: "preview")
 
 ### Content Context (Read-only)
-6. **getNodeDetails** - Get node data including template and fields
-7. **getNodeFields** - Read current field values (use before editing)
-8. **getNodeChildren** - Get child nodes for flow preview
-9. **getNodeTemplateFields** - Get field schema with assignment IDs
+7. **getNodeDetails** - Get node data including template and fields
+8. **getNodeFields** - Read current field values (use before editing)
+9. **getNodeChildren** - Get child nodes for flow preview (use recursive: true for batch)
+10. **getNodeTemplateFields** - Get field schema with assignment IDs
 
 ### Content Editing (for modifying source nodes)
-10. **updateNodeFields** - Update field values on source node
+11. **updateNodeFields** - Update field values on source node
     - Parameters: (nodeId?: string, fieldUpdates: { assignmentId: value })
     - Use this BEFORE regenerating a component with new content
 
@@ -151,6 +174,66 @@ Your code gives you full creative control over:
 | TextAndImagesBlock | standard, side-by-side, alternating | Mixed content |
 | VideoBlock | standard, theater, embedded | Video content |
 | ActionBlock | standard, sticky, floating | Navigation, CTAs |
+
+## LXD-Aware Variant Selection
+
+When nodes include LXD metadata (pedagogicalIntent, bloomsLevel), use this to automatically select the best variant:
+
+### Variant Selection by Pedagogical Intent
+
+| Intent | TitleBlock | TextBlock | QuestionBlock | InformationBlock |
+|--------|------------|-----------|---------------|------------------|
+| engage | hero, gradient | highlight | gamified | alert |
+| inform | standard | standard, two-column | standard | tip |
+| demonstrate | split | callout | card | standard |
+| practice | minimal | quote | gamified | success |
+| assess | standard | standard | card, gamified | warning |
+| summarize | minimal | callout | standard | success |
+| navigate | standard | standard | inline | standard |
+
+### Variant Selection by Bloom's Level
+
+| Bloom's Level | Suggested Variants |
+|---------------|-------------------|
+| remember | standard, minimal - clean and clear |
+| understand | two-column, callout - explanatory |
+| apply | card, gamified - interactive |
+| analyze | split, two-column - comparative |
+| evaluate | card, highlight - decision-focused |
+| create | hero, gradient - inspirational |
+
+**Example**: A QuestionBlock with \`pedagogicalIntent: "assess"\` and \`bloomsLevel: "apply"\` should use the **gamified** variant for an engaging assessment experience.
+
+## Batch Generation Workflow
+
+For generating previews for multiple nodes (e.g., an entire module):
+
+1. **Get scope**: Call \`getNodeChildren(parentNodeId, recursive: true)\` to get all Content Blocks
+2. **Collect node data**: For each Content Block, note the:
+   - nodeId
+   - contentBlockType (maps to baseType)
+   - pedagogicalIntent and bloomsLevel (for variant selection)
+   - field values (for content)
+3. **Select variants**: Use LXD metadata to choose appropriate variants
+4. **Generate JSX**: Write component code for each node
+5. **Call batchGenerateComponents**: Pass all components at once
+
+\`\`\`
+batchGenerateComponents({
+  components: [
+    { nodeId: "...", baseType: "TitleBlock", variant: "hero", jsxCode: "..." },
+    { nodeId: "...", baseType: "TextBlock", variant: "standard", jsxCode: "..." },
+    { nodeId: "...", baseType: "QuestionBlock", variant: "gamified", jsxCode: "..." }
+  ]
+})
+\`\`\`
+
+### Scope-Based Generation
+
+When user asks to "generate previews for Module 1" or similar:
+1. Get the module's nodeId
+2. Call getNodeChildren(moduleId, recursive: true) to get all Content Blocks
+3. Use batchGenerateComponents with all collected nodes
 
 ## JSX Code Generation Rules
 
@@ -439,11 +522,11 @@ export async function builderAgentNode(
   // Get frontend tools from CopilotKit state
   const frontendActions = state.copilotkit?.actions ?? [];
   
-  // Code generation tools (new sandbox-based preview)
-  // generateCustomComponent is the PRIMARY and ONLY way to create previews
+  // Code generation tools (both single and batch)
   const codeGenToolNames = [
-    "generateCustomComponent",  // PRIMARY: generates JSX code for sandbox
-    "previewInDevice",          // Preview at specific device size
+    "generateCustomComponent",   // Single node preview generation
+    "batchGenerateComponents",   // Batch generation for multiple nodes (PREFERRED for >3 nodes)
+    "previewInDevice",           // Preview at specific device size
   ];
   
   // Preview display control tools
@@ -459,7 +542,8 @@ export async function builderAgentNode(
     "getNodeTemplateFields",
     "getNodeFields",
     "getProjectHierarchyInfo",
-    "getNodeChildren",
+    "getNodeChildren",       // Use with recursive: true for batch scope
+    "getNodeTreeSnapshot",   // Get full tree for batch planning
     "selectNode",
   ];
   
@@ -476,6 +560,7 @@ export async function builderAgentNode(
 
   console.log("  Available tools:", builderAgentTools.map((t: { name: string }) => t.name).join(", ") || "none");
   console.log("  Total tools:", builderAgentTools.length);
+  console.log("  Builder progress:", state.builderProgress?.workflow || "none");
 
   // Build context-aware system message
   let systemContent = BUILDER_AGENT_SYSTEM_PROMPT;
@@ -623,6 +708,40 @@ When generating or selecting images, match these style preferences.`;
 - Current Node: ${state.previewState.currentNodeId || "None selected"}`;
   }
 
+  // Add builder progress context for continuity across orchestrator round-trips
+  if (state.builderProgress) {
+    const bp = state.builderProgress;
+    systemContent += `\n\n## Your Previous Progress (DO NOT REPEAT THESE STEPS)
+
+**Current Workflow Phase**: ${bp.workflow}
+**Current Scope**: ${bp.currentScope || "None"}
+**Generated Nodes**: ${bp.generatedNodeIds.length} nodes have previews
+**Pending Nodes**: ${bp.pendingNodeIds.length} nodes awaiting generation
+
+${bp.generatedNodeIds.length > 0 ? `**Already Generated (don't regenerate):**
+${bp.generatedNodeIds.slice(-10).map(id => `- ${id}`).join("\n")}` : ""}
+
+${bp.pendingNodeIds.length > 0 ? `**Still Need Generation:**
+${bp.pendingNodeIds.slice(0, 10).map(id => `- ${id}`).join("\n")}${bp.pendingNodeIds.length > 10 ? `\n... and ${bp.pendingNodeIds.length - 10} more` : ""}` : ""}
+
+**Recent Actions Taken**:
+${bp.toolCallSummary.slice(-5).map(s => `- ${s}`).join("\n") || "No actions recorded yet"}
+
+**IMPORTANT**: Continue from where you left off. Don't re-generate previews for nodes that already have them.`;
+  }
+
+  // Add LXD node data cache if available (for batch operations)
+  if (state.builderProgress?.nodeDataCache) {
+    const cache = state.builderProgress.nodeDataCache;
+    const cacheEntries = Object.entries(cache).slice(0, 10);
+    if (cacheEntries.length > 0) {
+      systemContent += `\n\n## Cached Node Data (for batch generation)
+${cacheEntries.map(([nodeId, data]) => 
+  `- ${nodeId}: ${data.title} (${data.contentBlockType || 'unknown'}, intent: ${data.pedagogicalIntent || 'none'})`
+).join("\n")}`;
+    }
+  }
+
   const systemMessage = new SystemMessage({ content: systemContent });
 
   // Bind tools and invoke
@@ -630,16 +749,39 @@ When generating or selecting images, match these style preferences.`;
     ? builderAgentModel.bindTools(builderAgentTools)
     : builderAgentModel;
 
-  // Filter messages for this agent's context
-  const strippedMessages = stripThinkingBlocks(state.messages || []);
-  const slicedMessages = strippedMessages.slice(-15);
-  const recentMessages = filterOrphanedToolResults(slicedMessages, "[builder-agent]");
+  // USE BUILDER-SPECIFIC MESSAGE CHANNEL for context preservation
+  // This preserves the builder's conversation history across orchestrator round-trips
+  let builderConversation: BaseMessage[] = [];
+  
+  if (state.builderMessages && state.builderMessages.length > 0) {
+    // Use builder's own message channel (already filtered and maintained)
+    // CRITICAL: Must deduplicate tool_use IDs first - accumulated messages can have duplicates
+    // Then filter orphaned results and repair dangling tool calls
+    let deduplicated = deduplicateToolUseIds(state.builderMessages, "[builder-agent]");
+    let filtered = filterOrphanedToolResults(deduplicated, "[builder-agent]");
+    builderConversation = repairDanglingToolCalls(filtered, "[builder-agent]");
+    console.log(`  Using ${builderConversation.length} messages from builderMessages channel (from ${state.builderMessages.length})`);
+  } else {
+    // First invocation or fresh start - use recent messages from main channel
+    const strippedMessages = stripThinkingBlocks(state.messages || []);
+    const slicedMessages = strippedMessages.slice(-15);
+    // Also deduplicate in case main channel has duplicates
+    let deduplicated = deduplicateToolUseIds(slicedMessages, "[builder-agent]");
+    builderConversation = filterOrphanedToolResults(deduplicated, "[builder-agent]");
+    console.log(`  First invocation - using ${builderConversation.length} messages from main channel`);
+  }
 
   console.log("  Invoking builder agent model...");
 
+  // Configure CopilotKit for proper tool emission (emits tool calls to frontend)
+  const customConfig = copilotkitCustomizeConfig(config, {
+    emitToolCalls: true,
+    emitMessages: true,
+  });
+
   let response = await modelWithTools.invoke(
-    [systemMessage, ...recentMessages],
-    config
+    [systemMessage, ...builderConversation],
+    customConfig
   );
 
   console.log("  Builder agent response received");
@@ -665,10 +807,10 @@ When generating or selecting images, match these style preferences.`;
        </motion.div>
      );
    };
-3. Call generateCustomComponent with:
+3. Call generateCustomComponent (single) or batchGenerateComponents (multiple) with:
    - nodeId: the node's ID
    - baseType: component type (e.g., "TitleBlock")
-   - variant: layout variant (e.g., "hero")
+   - variant: layout variant (e.g., "hero") - use LXD metadata to choose!
    - jsxCode: your COMPLETE component code
 
 CRITICAL: Your jsxCode MUST start with "const ComponentName = () =>" - never just "return" or raw JSX.`,
@@ -676,8 +818,8 @@ CRITICAL: Your jsxCode MUST start with "const ComponentName = () =>" - never jus
 
     console.log("  [RETRY] Re-invoking with nudge...");
     response = await modelWithTools.invoke(
-      [systemMessage, ...recentMessages, nudgeMessage],
-      config
+      [systemMessage, ...builderConversation, nudgeMessage],
+      customConfig
     );
     
     aiResponse = response as AIMessage;
@@ -692,12 +834,125 @@ CRITICAL: Your jsxCode MUST start with "const ComponentName = () =>" - never jus
     }
   }
 
+  // Extract component generation calls (both single and batch) to store in state
+  // This stores the JSX separately so it can be stripped from message history
+  const generatedComponents: GeneratedComponent[] = [];
+  const newGeneratedNodeIds: string[] = [];
+  const toolCallSummaries: string[] = [];
+  
+  if (aiResponse.tool_calls?.length) {
+    for (const tc of aiResponse.tool_calls) {
+      // Handle single component generation
+      if (tc.name === "generateCustomComponent" && tc.args?.nodeId && tc.args?.jsxCode) {
+        const existingVersion = (state.generatedComponents || []).find(
+          c => c.nodeId === tc.args.nodeId
+        )?.version || 0;
+        
+        generatedComponents.push({
+          nodeId: tc.args.nodeId,
+          baseType: tc.args.baseType || "Unknown",
+          variant: tc.args.variant || "standard",
+          jsxCode: tc.args.jsxCode,
+          animationConfig: tc.args.animationConfig,
+          generatedAt: new Date().toISOString(),
+          version: existingVersion + 1,
+        });
+        
+        newGeneratedNodeIds.push(tc.args.nodeId);
+        toolCallSummaries.push(`Generated ${tc.args.baseType}/${tc.args.variant} for ${tc.args.nodeId.substring(0, 8)}...`);
+        console.log(`  [STORE] Storing component for node ${tc.args.nodeId} (${tc.args.baseType}/${tc.args.variant})`);
+      }
+      
+      // Handle batch component generation
+      if (tc.name === "batchGenerateComponents" && tc.args?.components) {
+        const components = tc.args.components as Array<{
+          nodeId: string;
+          baseType: string;
+          variant: string;
+          jsxCode: string;
+          animationConfig?: any;
+        }>;
+        
+        for (const comp of components) {
+          if (comp.nodeId && comp.jsxCode) {
+            const existingVersion = (state.generatedComponents || []).find(
+              c => c.nodeId === comp.nodeId
+            )?.version || 0;
+            
+            generatedComponents.push({
+              nodeId: comp.nodeId,
+              baseType: comp.baseType || "Unknown",
+              variant: comp.variant || "standard",
+              jsxCode: comp.jsxCode,
+              animationConfig: comp.animationConfig,
+              generatedAt: new Date().toISOString(),
+              version: existingVersion + 1,
+            });
+            
+            newGeneratedNodeIds.push(comp.nodeId);
+          }
+        }
+        
+        toolCallSummaries.push(`Batch generated ${components.length} components`);
+        console.log(`  [BATCH] Storing ${components.length} components from batch call`);
+      }
+      
+      // Track other tool calls for context
+      if (tc.name === "getNodeChildren") {
+        toolCallSummaries.push(`Fetched children${tc.args?.nodeId ? ` of ${String(tc.args.nodeId).substring(0, 8)}...` : ""}`);
+      }
+      if (tc.name === "getNodeDetails") {
+        toolCallSummaries.push(`Got details for ${tc.args?.nodeId ? String(tc.args.nodeId).substring(0, 8) + "..." : "node"}`);
+      }
+    }
+  }
+
+  // Determine workflow phase based on activity
+  let workflowPhase: BuilderProgress["workflow"] = state.builderProgress?.workflow || "idle";
+  if (newGeneratedNodeIds.length > 0) {
+    workflowPhase = "generating";
+  }
+  
+  // Check if we're done (user indicated satisfaction or said [DONE])
+  const responseText = typeof aiResponse.content === "string"
+    ? aiResponse.content
+    : Array.isArray(aiResponse.content)
+    ? aiResponse.content
+        .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && "type" in b && b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    : "";
+  
+  if (responseText.toLowerCase().includes("[done]")) {
+    workflowPhase = "complete";
+  }
+
+  // Build updated progress state
+  const builderProgressUpdate: BuilderProgress = {
+    workflow: workflowPhase,
+    currentScope: state.builderProgress?.currentScope || null,
+    generatedNodeIds: newGeneratedNodeIds,
+    pendingNodeIds: (state.builderProgress?.pendingNodeIds || []).filter(
+      id => !newGeneratedNodeIds.includes(id)
+    ),
+    toolCallSummary: toolCallSummaries,
+    nodeDataCache: state.builderProgress?.nodeDataCache,
+    lastUpdated: new Date().toISOString(),
+  };
+
   return {
     messages: [response],
     currentAgent: "builder_agent",
     agentHistory: ["builder_agent"],
     // Clear routing decision when this agent starts
     routingDecision: null,
+    // Store generated components separately from messages
+    // This allows jsxCode to be stripped from message history while preserving the data
+    ...(generatedComponents.length > 0 ? { generatedComponents } : {}),
+    // CRITICAL: Append to builder's own message channel for continuity
+    builderMessages: [response],
+    // Update builder progress state for semantic context
+    builderProgress: builderProgressUpdate,
   };
 }
 

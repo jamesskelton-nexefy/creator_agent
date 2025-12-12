@@ -20,6 +20,7 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage, BaseMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
+import { copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
 import type { OrchestratorState, ContentOutput, PlannedNode, ActiveTask, WriterProgress } from "../state/agent-state";
 import { getCondensedBrief, getCondensedResearch, generateTaskContext } from "../state/agent-state";
 
@@ -29,6 +30,9 @@ import {
   repairDanglingToolCalls,
   hasUsableResponse,
 } from "../utils";
+
+// Image Generator tool (compiled graph wrapped as tool)
+import { imageGeneratorTool } from "./image-generator";
 
 // Message filtering now handled by centralized utils/context-management.ts
 
@@ -209,6 +213,69 @@ When creating content nodes, proactively generate and attach relevant images to 
 - Avoid copyrighted characters, logos, or brand names
 - Specify composition when relevant: "centered", "wide shot", "close-up"
 
+## Batch Image Generation with generateImagesForNodes
+
+For efficient image generation across multiple nodes, use the **generateImagesForNodes** tool instead of calling generateAIImage for each node individually. This tool handles batch image generation with context isolation.
+
+### When to Use generateImagesForNodes
+
+Use the batch tool for generating images across multiple content blocks:
+
+| Situation | Action |
+|-----------|--------|
+| Small batch (1 section, 5-10 nodes) | Call immediately after writing content |
+| Large course (multiple sections) | Accumulate nodes, call at section boundaries |
+| High-impact visuals (title_block, banners) | Call immediately for key visuals |
+| Final writing batch | Call for all remaining image-needing nodes |
+| Image-heavy section (three_images_block) | Call immediately to prevent backlog |
+
+### Content Blocks Requiring Images
+
+Track these as you write - they need images:
+- **title_block** - Hero/banner image (required)
+- **three_images_block** - Three related images (required)
+- **image_banner_block** - Wide banner (required)
+- **text_and_images_block** - Contextual image (required)
+- **question_block** - Only if scenario-based (optional)
+- **video_block** - Thumbnail/poster (optional)
+
+### How to Call generateImagesForNodes
+
+\`\`\`
+generateImagesForNodes({
+  nodes: JSON.stringify([
+    {
+      nodeId: "abc-123",
+      contentBlockType: "title_block",
+      title: "Introduction to Risk Management",
+      description: "Opening section for the risk module",
+      pedagogicalIntent: "engage",
+      bloomsLevel: "remember"
+    },
+    {
+      nodeId: "def-456",
+      contentBlockType: "three_images_block",
+      title: "Types of Financial Risk",
+      pedagogicalIntent: "inform",
+      bloomsLevel: "understand"
+    }
+  ]),
+  visualDesign: JSON.stringify({
+    theme: "corporate",
+    tone: "professional",
+    style: "modern clean"
+  })
+})
+\`\`\`
+
+### Important Notes for Image Generation
+
+- **Prefer generateImagesForNodes** over individual generateAIImage calls for multiple nodes
+- Include **pedagogicalIntent** and **bloomsLevel** for better image prompting
+- Pass **visualDesign** context from state for style consistency
+- The tool returns a summary - check for any failures and retry if needed
+- Images are generated but may need manual attachment via attachMicroverseToNode
+
 ## Writing Guidelines
 
 ### Tone & Voice
@@ -237,13 +304,115 @@ When creating content nodes, proactively generate and attach relevant images to 
 - Include industry examples and scenarios
 - Consider the learner's work context
 
-## Content Types You Create
+## Content Block Type-Specific Writing Patterns
 
-- **Text Blocks** - Explanatory content, descriptions
-- **Lists** - Steps, bullet points, key takeaways
-- **Examples** - Case studies, scenarios, demonstrations
-- **Activities** - Interactive elements, reflection prompts
-- **Summaries** - Key points, recaps
+Each content block type requires a different writing approach. Check the node's \`contentBlockType\` field and write accordingly:
+
+**Title Block:**
+- Write attention-grabbing, expectation-setting content
+- Include a clear learning promise (what the learner will achieve)
+- Use action-oriented language: "Learn to...", "Master...", "Discover..."
+- Keep titles concise but impactful (3-8 words)
+
+**Text Block:**
+- Write core explanatory content with clear structure
+- Use headers and subheaders to chunk information
+- Include examples and applications throughout
+- Aim for 50-200 words per major point
+- Make content scannable with bullets for lists
+
+**Information Block:**
+Match writing style to the icon/color type:
+- **Lightbulb/Blue**: Tips, insights - "Did you know..." or "Pro tip:"
+- **Tick/Green**: Successes, confirmations - "Key takeaway:" or "Remember:"
+- **Cross/Red**: Warnings, errors to avoid - "Caution:" or "Avoid:"
+- **Important/Orange**: Prerequisites, critical notes - "Important:" or "Note:"
+
+**Question Block:**
+- Write clear, focused question stems (single concept per question)
+- Avoid negative phrasing ("Which is NOT...")
+- Create plausible distractors (wrong answers should be believable but clearly incorrect)
+- Write feedback that explains WHY the answer is correct/incorrect
+- Match question complexity to the Bloom's level:
+  - Remember: "What is...?", "Which of the following..."
+  - Understand: "Why does...?", "Explain how..."
+  - Apply: "In this scenario, what would you...?"
+  - Analyze: "What is the relationship between...?"
+
+**Action Block:**
+- Write clear, actionable instructions
+- Use imperative voice: "Download the template", "Practice this technique"
+- Include context for why the action matters
+- Provide specific guidance on what to do next
+
+**Video Block:**
+- Write companion text introducing the video's purpose
+- Include 2-3 key points to watch for
+- Add a follow-up reflection prompt or question
+- Keep text brief - the video is the main content
+
+**Animation Block / Three Images Block:**
+- Write progressive, slide-by-slide narrative text
+- Use sequential language: "First...", "Next...", "Finally..."
+- Make each slide/image self-contained but connected
+- Include captions that add meaning beyond the visual
+
+**Text and Images Block:**
+- Balance text and visual elements
+- Use the CTA (button) for clear next actions
+- Connect the image to the text content explicitly
+- Include reflection prompts where appropriate
+
+**Image Banner Block:**
+- Keep text minimal - let the image speak
+- Use for atmosphere and context-setting
+- Include brief caption if needed
+
+## Using Architect's LXD Metadata
+
+When the courseStructure contains LXD metadata from the Architect, use it to guide your writing:
+
+**Bloom's Level Adaptation (\`bloomsLevel\` field):**
+- **remember**: Use definition format, lists, key terms. Focus on recognition and recall.
+- **understand**: Use explanations, examples, analogies. Include "in other words" restatements.
+- **apply**: Use scenarios, case studies, "what would you do" situations. Focus on real-world application.
+- **analyze**: Use comparisons, cause-effect relationships, breakdowns. Include "why" and "how" explanations.
+- **evaluate**: Use judgment scenarios, decision-making situations. Ask learners to assess options.
+- **create**: Use open-ended prompts, synthesis tasks, project-based activities.
+
+**Pedagogical Intent Adaptation (\`pedagogicalIntent\` field):**
+- **engage**: Use ARCS Attention techniques - surprising facts, thought-provoking questions, relevance hooks.
+- **inform**: Focus on clear, accurate information delivery. Use structured explanations.
+- **demonstrate**: Use step-by-step walkthroughs, visual examples, process explanations.
+- **practice**: Provide clear instructions, scaffolded activities, practice opportunities.
+- **assess**: Design for measurement - clear success criteria, unambiguous questions, diagnostic feedback.
+- **summarize**: Recap key points, reinforce main concepts, provide memory aids.
+- **navigate**: Clear direction, next steps, pathway guidance.
+
+**Linked Objectives (\`linkedObjectives\` field):**
+- Ensure your content directly addresses the linked learning objectives
+- Reference the objective explicitly where appropriate: "By the end of this section, you will be able to..."
+- Verify that content can be traced back to the project brief objectives
+
+## Field-Specific Writing Guidance
+
+When updating node fields, follow these guidelines for each field type:
+
+| Field | Writing Approach |
+|-------|-----------------|
+| \`title_text\` | Action-oriented, clear topic indicator, 3-8 words. Use title case. |
+| \`text\` | Structured prose, scannable, 50-200 words per chunk. Use headers and bullets. |
+| \`question_text\` | Single concept, clear scenario, avoid negatives. End with a question mark. |
+| \`answer_text_1/2/3/4\` | Parallel structure, similar length, one clearly correct. Keep under 50 words each. |
+| \`feedback_text\` | Explain reasoning, redirect to content, encourage. 30-100 words. |
+| \`button_text\` | Action verb + object, 2-4 words. E.g., "Continue Learning", "Download Guide" |
+| \`info_icon\` | Match to content tone: Lightbulb/Blue (tips), Tick/Green (success), Cross/Red (warning), Important/Orange (caution) |
+
+**Visual Design Integration:**
+When \`visualDesign\` is available, align your writing with:
+- \`writingTone.tone\`: Match formality (professional/conversational/academic/engaging)
+- \`writingTone.voice\`: Use correct person (first/second/third)
+- \`writingTone.complexity\`: Adjust vocabulary and sentence structure (simple/intermediate/advanced)
 
 ## Guidelines
 
@@ -289,7 +458,7 @@ export async function writerNode(
   // Get frontend tools from CopilotKit state
   // The writer uses CRUD for content + navigation to find structure + media tools
   const frontendActions = state.copilotkit?.actions ?? [];
-  const writerTools = frontendActions.filter((action: { name: string }) =>
+  const frontendTools = frontendActions.filter((action: { name: string }) =>
     [
       // SNAPSHOT - Get full picture in ONE call (use FIRST!)
       "getNodeTreeSnapshot",
@@ -311,10 +480,14 @@ export async function writerNode(
       // Media integration
       "searchMicroverse",
       "attachMicroverseToNode",
-      // Image generation
+      // Direct image generation (for single images when needed)
       "generateAIImage",
     ].includes(action.name)
   );
+
+  // Combine frontend tools with backend tools (imageGeneratorTool)
+  // imageGeneratorTool is a compiled StateGraph that handles batch image generation
+  const writerTools = [...frontendTools, imageGeneratorTool];
 
   console.log("  Available tools:", writerTools.map((t: { name: string }) => t.name).join(", ") || "none");
 
@@ -372,11 +545,30 @@ ${state.writerProgress.hierarchyCache ? `**Cached Hierarchy Info**:
 ${state.visualDesign.notes ? `Additional notes: ${state.visualDesign.notes}` : ""}`;
   }
 
-  // Include course structure with progress
+  // Include course structure with progress and LXD metadata
   if (state.courseStructure) {
     const plannedNodes = state.courseStructure.nodes;
     const writtenTempIds = new Set(state.writtenContent?.map((w) => w.tempId) || []);
     const remaining = plannedNodes.filter((n) => !writtenTempIds.has(n.tempId));
+
+    // Format node with LXD metadata if present
+    const formatNodeWithLXD = (n: PlannedNode): string => {
+      let line = `- ${n.tempId}: "${n.title}" (${n.nodeType}, level ${n.level})`;
+      
+      // Add LXD metadata for Content Blocks (level 6)
+      if (n.level === 6) {
+        const lxdParts: string[] = [];
+        if (n.contentBlockType) lxdParts.push(`type: ${n.contentBlockType}`);
+        if (n.pedagogicalIntent) lxdParts.push(`intent: ${n.pedagogicalIntent}`);
+        if (n.bloomsLevel) lxdParts.push(`bloom: ${n.bloomsLevel}`);
+        if (n.linkedObjectives?.length) lxdParts.push(`objectives: ${n.linkedObjectives.join(", ")}`);
+        
+        if (lxdParts.length > 0) {
+          line += `\n  LXD: [${lxdParts.join(" | ")}]`;
+        }
+      }
+      return line;
+    };
 
     systemContent += `\n\n## Course Structure to Write
 
@@ -387,8 +579,18 @@ ${state.visualDesign.notes ? `Additional notes: ${state.visualDesign.notes}` : "
 ### Nodes to Write:
 ${remaining
   .slice(0, 10)
-  .map((n) => `- ${n.tempId}: "${n.title}" (${n.nodeType}, level ${n.level})`)
+  .map(formatNodeWithLXD)
   .join("\n")}${remaining.length > 10 ? `\n... and ${remaining.length - 10} more` : ""}`;
+
+    // Include LXD strategy summary if available
+    if (state.courseStructure.lxdStrategy) {
+      const lxd = state.courseStructure.lxdStrategy;
+      systemContent += `\n\n### LXD Strategy
+**Assessment Approach**: ${lxd.assessmentApproach}
+**Engagement Pattern**: ${lxd.engagementPattern}
+**Target Audience Adaptations**: ${lxd.targetAudienceAdaptations}
+**Estimated Duration**: ${lxd.estimatedDuration}`;
+    }
   }
 
   // Track already created nodes
@@ -429,9 +631,15 @@ ${state.createdNodes.map((n) => `- "${n.title}" (ID: ${n.nodeId.substring(0, 8)}
 
   console.log("  Invoking writer model...");
 
+  // Configure CopilotKit for proper tool emission (emits tool calls to frontend)
+  const customConfig = copilotkitCustomizeConfig(config, {
+    emitToolCalls: true,
+    emitMessages: true,
+  });
+
   let response = await modelWithTools.invoke(
     [systemMessage, ...writerConversation],
-    config
+    customConfig
   );
 
   console.log("  Writer response received");
@@ -458,7 +666,7 @@ The user is waiting for you to write content.`,
     console.log("  [RETRY] Re-invoking with nudge...");
     response = await modelWithTools.invoke(
       [systemMessage, ...writerConversation, nudgeMessage],
-      config
+      customConfig
     );
     
     aiResponse = response as AIMessage;
@@ -644,6 +852,24 @@ export function generateWritingBrief(
 **Type**: ${node.nodeType}
 **Level**: ${node.level}
 **Description**: ${node.description}`;
+
+  // Include LXD metadata if present (for Content Blocks)
+  if (node.contentBlockType || node.pedagogicalIntent || node.bloomsLevel || node.linkedObjectives?.length) {
+    brief += `\n\n**LXD Guidance**:`;
+    if (node.contentBlockType) {
+      brief += `\n- Content Block Type: \`${node.contentBlockType}\` - Use the appropriate writing pattern for this block type`;
+    }
+    if (node.pedagogicalIntent) {
+      brief += `\n- Pedagogical Intent: \`${node.pedagogicalIntent}\` - Write to ${node.pedagogicalIntent} the learner`;
+    }
+    if (node.bloomsLevel) {
+      brief += `\n- Bloom's Level: \`${node.bloomsLevel}\` - Target this cognitive level in your content`;
+    }
+    if (node.linkedObjectives?.length) {
+      brief += `\n- Linked Objectives: ${node.linkedObjectives.map(o => `"${o}"`).join(", ")}`;
+      brief += `\n  Ensure your content directly addresses these learning objectives`;
+    }
+  }
 
   if (node.objectives?.length) {
     brief += `\n\n**Learning Objectives**:\n${node.objectives.map((o) => `- ${o}`).join("\n")}`;

@@ -8,11 +8,14 @@ export {
   // Constants
   TOKEN_LIMITS,
   MESSAGE_LIMITS,
+  TOOLS_WITH_LARGE_ARGS,
   // Helper functions
   getMessageType,
   hasNonEmptyTextContent,
   hasUsableResponse,
   stripThinkingBlocks,
+  deduplicateToolUseIds,
+  enforceToolResultOrdering,
   // Core functions
   filterOrphanedToolResults,
   repairDanglingToolCalls,
@@ -20,6 +23,7 @@ export {
   summarizeIfNeeded,
   clearOldToolResults,
   compressToolResults,
+  stripLargeToolCallArgs,
   processContext,
   // Types
   type TrimMessagesOptions,
@@ -27,6 +31,7 @@ export {
   type ClearToolResultsOptions,
   type CompressToolResultsOptions,
   type ToolCompressionRule,
+  type StripLargeToolCallArgsOptions,
   type ProcessContextOptions,
 } from "./context-management";
 

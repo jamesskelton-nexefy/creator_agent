@@ -33,3 +33,7 @@ export { documentAgentNode } from "./document-agent";
 export { mediaAgentNode } from "./media-agent";
 export { frameworkAgentNode } from "./framework-agent";
 
+// Image Generator (compiled StateGraph as tool)
+// Used by Writer for batch image generation with context isolation
+export { imageGeneratorTool, imageGeneratorGraph } from "./image-generator";
+

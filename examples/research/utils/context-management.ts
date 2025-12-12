@@ -102,6 +102,221 @@ export function hasUsableResponse(response: AIMessage): boolean {
 }
 
 /**
+ * Deduplicates tool_use IDs across messages.
+ * CRITICAL: Anthropic API requires all tool_use IDs to be unique.
+ * When messages accumulate over multiple invocations (e.g., builderMessages channel),
+ * duplicate tool_use IDs can occur, causing API errors.
+ * 
+ * This function:
+ * 1. Tracks all tool_use IDs seen across messages
+ * 2. For AI messages with duplicate tool_use IDs, strips the duplicates from both
+ *    tool_calls property and content array
+ * 3. Skips tool_result messages for tool_use IDs that were stripped
+ * 
+ * @param messages - Array of messages to deduplicate
+ * @param logPrefix - Optional prefix for log messages
+ * @returns Deduplicated array of messages
+ */
+export function deduplicateToolUseIds(
+  messages: BaseMessage[],
+  logPrefix: string = ""
+): BaseMessage[] {
+  const prefix = logPrefix ? `${logPrefix} ` : "";
+  const seenToolUseIds = new Set<string>();
+  const strippedToolUseIds = new Set<string>();
+  const result: BaseMessage[] = [];
+
+  for (const msg of messages) {
+    const msgType = getMessageType(msg);
+
+    // Handle AI messages - deduplicate tool_use IDs
+    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
+      const aiMsg = msg as AIMessage;
+      let modified = false;
+      
+      // Filter tool_calls property for duplicates
+      let filteredToolCalls = aiMsg.tool_calls;
+      if (aiMsg.tool_calls?.length) {
+        filteredToolCalls = aiMsg.tool_calls.filter(tc => {
+          if (tc.id && seenToolUseIds.has(tc.id)) {
+            console.log(`  ${prefix}[DEDUP] Removing duplicate tool_use from tool_calls: ${tc.id}`);
+            strippedToolUseIds.add(tc.id);
+            modified = true;
+            return false;
+          }
+          if (tc.id) {
+            seenToolUseIds.add(tc.id);
+          }
+          return true;
+        });
+      }
+
+      // Filter content array for duplicate tool_use blocks
+      let filteredContent = aiMsg.content;
+      if (Array.isArray(aiMsg.content)) {
+        const newContent: any[] = [];
+        for (const block of aiMsg.content as any[]) {
+          if (typeof block === "object" && block !== null && block.type === "tool_use" && block.id) {
+            if (seenToolUseIds.has(block.id)) {
+              console.log(`  ${prefix}[DEDUP] Removing duplicate tool_use from content: ${block.id}`);
+              strippedToolUseIds.add(block.id);
+              modified = true;
+              continue;
+            }
+            seenToolUseIds.add(block.id);
+          }
+          newContent.push(block);
+        }
+        if (modified) {
+          filteredContent = newContent.length > 0 ? newContent : "";
+        }
+      }
+
+      // If we modified the message, create a new one
+      if (modified) {
+        // If no tool_calls left and no content, skip the message entirely
+        const hasToolCalls = filteredToolCalls && filteredToolCalls.length > 0;
+        const hasContent = typeof filteredContent === "string" 
+          ? filteredContent.trim().length > 0 
+          : Array.isArray(filteredContent) && filteredContent.length > 0;
+        
+        if (!hasToolCalls && !hasContent) {
+          console.log(`  ${prefix}[DEDUP] Skipping AI message with no remaining content/tool_calls`);
+          continue;
+        }
+
+        const newMsg = new AIMessage({
+          content: filteredContent,
+          tool_calls: filteredToolCalls,
+          additional_kwargs: aiMsg.additional_kwargs,
+          response_metadata: aiMsg.response_metadata,
+        });
+        result.push(newMsg);
+      } else {
+        result.push(msg);
+      }
+      continue;
+    }
+
+    // Handle tool_result messages - skip if the tool_use was stripped
+    if (msgType === "tool" || msgType === "ToolMessage") {
+      const toolMsg = msg as ToolMessage;
+      if (strippedToolUseIds.has(toolMsg.tool_call_id)) {
+        console.log(`  ${prefix}[DEDUP] Skipping tool_result for stripped tool_use: ${toolMsg.tool_call_id}`);
+        continue;
+      }
+    }
+
+    result.push(msg);
+  }
+
+  const duplicatesFound = strippedToolUseIds.size;
+  if (duplicatesFound > 0) {
+    console.log(`  ${prefix}[DEDUP] Removed ${duplicatesFound} duplicate tool_use IDs`);
+  }
+
+  return result;
+}
+
+/**
+ * Ensures every tool_use has a tool_result immediately after.
+ * This is a strict enforcement of Anthropic's API requirements.
+ * 
+ * For each AI message with tool_calls:
+ * 1. Check if the next message(s) are ToolMessages for those calls
+ * 2. If not, insert synthetic ToolMessages immediately after
+ * 
+ * This is more aggressive than repairDanglingToolCalls because it
+ * enforces POSITION, not just existence.
+ * 
+ * @param messages - Array of messages to process
+ * @param logPrefix - Optional prefix for log messages
+ * @returns Messages with strict tool_use/tool_result ordering
+ */
+export function enforceToolResultOrdering(
+  messages: BaseMessage[],
+  logPrefix: string = ""
+): BaseMessage[] {
+  const prefix = logPrefix ? `${logPrefix} ` : "";
+  const result: BaseMessage[] = [];
+  let insertedCount = 0;
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    const msgType = getMessageType(msg);
+
+    // Add the current message
+    result.push(msg);
+
+    // Check if it's an AI message with tool_calls
+    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
+      const aiMsg = msg as AIMessage;
+      
+      // Collect all tool_call IDs from this message
+      const toolCallIds: Array<{ id: string; name: string }> = [];
+      
+      if (aiMsg.tool_calls?.length) {
+        for (const tc of aiMsg.tool_calls) {
+          if (tc.id) {
+            toolCallIds.push({ id: tc.id, name: tc.name });
+          }
+        }
+      }
+      
+      // Also check content array for tool_use blocks
+      if (Array.isArray(aiMsg.content)) {
+        for (const block of aiMsg.content as any[]) {
+          if (typeof block === "object" && block !== null && block.type === "tool_use" && block.id) {
+            if (!toolCallIds.some(tc => tc.id === block.id)) {
+              toolCallIds.push({ id: block.id, name: block.name || "unknown_tool" });
+            }
+          }
+        }
+      }
+
+      if (toolCallIds.length === 0) continue;
+
+      // Check which tool_calls have results in the IMMEDIATELY following messages
+      const resolvedIds = new Set<string>();
+      
+      // Look at messages immediately after this one
+      for (let j = i + 1; j < messages.length; j++) {
+        const nextMsg = messages[j];
+        const nextType = getMessageType(nextMsg);
+        
+        // Stop at the first non-tool message
+        if (nextType !== "tool" && nextType !== "ToolMessage") {
+          break;
+        }
+        
+        const toolMsg = nextMsg as ToolMessage;
+        resolvedIds.add(toolMsg.tool_call_id);
+      }
+
+      // Add synthetic results for any unresolved tool_calls
+      for (const tc of toolCallIds) {
+        if (!resolvedIds.has(tc.id)) {
+          const syntheticResult = new ToolMessage({
+            content: `[Tool call interrupted - no result available]`,
+            tool_call_id: tc.id,
+            name: tc.name,
+          });
+          result.push(syntheticResult);
+          insertedCount++;
+          console.log(`  ${prefix}[ENFORCE] Inserted synthetic tool_result for: ${tc.id} (${tc.name})`);
+        }
+      }
+    }
+  }
+
+  if (insertedCount > 0) {
+    console.log(`  ${prefix}[ENFORCE] Inserted ${insertedCount} synthetic tool_results for strict ordering`);
+  }
+
+  return result;
+}
+
+/**
  * Strips thinking blocks from messages.
  * Required when an agent has thinking DISABLED but receives messages from
  * agents that have thinking ENABLED.
@@ -695,7 +910,7 @@ export async function trimMessages(
     // AI messages are safe if they don't have tool calls that need results
     if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
       const aiMsg = msg as AIMessage;
-      const hasToolCalls = aiMsg.tool_calls?.length > 0;
+      const hasToolCalls = (aiMsg.tool_calls?.length ?? 0) > 0;
       if (!hasToolCalls) {
         break;
       }
@@ -796,15 +1011,24 @@ Conversation to summarize:`;
  * Preserves recent messages and replaces older ones with a summary.
  *
  * Based on LangChain's summarizationMiddleware pattern.
+ * Returns summary separately (not as a message) - caller should store in state
+ * and inject as SystemMessage when calling the LLM.
  *
  * @param messages - Messages to potentially summarize
  * @param options - Summarization options
- * @returns Messages with older ones summarized if threshold reached
+ * @returns Object with processed messages and optional summary text
  */
+export interface SummarizeResult {
+  /** Processed messages (with older ones removed if summarized) */
+  messages: BaseMessage[];
+  /** Generated summary text, or null if no summarization occurred */
+  summary: string | null;
+}
+
 export async function summarizeIfNeeded(
   messages: BaseMessage[],
   options: SummarizeOptions = {}
-): Promise<BaseMessage[]> {
+): Promise<SummarizeResult> {
   const {
     triggerTokens = 100000,
     keepMessages = 20,
@@ -818,7 +1042,7 @@ export async function summarizeIfNeeded(
 
   // Quick check: if we have fewer messages than keepMessages, no summarization needed
   if (messages.length <= keepMessages) {
-    return messages;
+    return { messages, summary: null };
   }
 
   // Separate system messages (always keep at start)
@@ -834,7 +1058,7 @@ export async function summarizeIfNeeded(
 
   // If conversation portion is small enough, no summarization needed
   if (conversationMessages.length <= keepMessages) {
-    return messages;
+    return { messages, summary: null };
   }
 
   // Estimate token count (rough: ~4 chars per token)
@@ -846,7 +1070,7 @@ export async function summarizeIfNeeded(
   }, 0);
 
   if (estimatedTokens < triggerTokens) {
-    return messages;
+    return { messages, summary: null };
   }
 
   console.log(`  ${prefix}[SUMMARIZE] Triggering summarization (est. ${estimatedTokens} tokens, ${messages.length} messages)`);
@@ -880,17 +1104,19 @@ export async function summarizeIfNeeded(
 
     console.log(`  ${prefix}[SUMMARIZE] Created summary (${summaryText.length} chars) replacing ${toSummarize.length} messages`);
 
-    // Create summary as a system message
-    const summaryMessage = new SystemMessage({
-      content: `${summaryPrefix}\n\n${summaryText}`,
-    });
-
-    // Return: system messages + summary + kept messages
-    return [...systemMessages, summaryMessage, ...toKeep];
+    // Return summary separately (not as a message) - caller injects as SystemMessage
+    // This follows LangChain's recommended pattern for conversation summarization
+    return {
+      messages: [...systemMessages, ...toKeep],
+      summary: summaryText,
+    };
   } catch (error) {
     console.error(`  ${prefix}[SUMMARIZE] Failed to generate summary:`, error);
-    // On failure, fall back to simple trimming
-    return [...systemMessages, ...toKeep];
+    // On failure, fall back to simple trimming without summary
+    return {
+      messages: [...systemMessages, ...toKeep],
+      summary: null,
+    };
   }
 }
 
@@ -1227,7 +1453,7 @@ export function clearOldToolResults(
 
     if (msgType === "tool" || msgType === "ToolMessage") {
       const toolMsg = msg as ToolMessage;
-      toolResultIndices.push({ index: i, toolName: toolMsg.name });
+      toolResultIndices.push({ index: i, toolName: toolMsg.name || "unknown" });
     }
   }
 
@@ -1335,6 +1561,159 @@ export function clearOldToolResults(
 }
 
 // ============================================================================
+// STRIP LARGE TOOL CALL ARGUMENTS
+// ============================================================================
+
+/**
+ * Tools that generate large arguments which should be stripped from older messages.
+ * These tools store data that can bloat the message history significantly.
+ */
+export const TOOLS_WITH_LARGE_ARGS = new Set([
+  "generateCustomComponent", // jsxCode can be 3-5KB each
+]);
+
+export interface StripLargeToolCallArgsOptions {
+  /** Number of most recent tool calls per tool type to keep with full args */
+  keepCount?: number;
+  /** Which tools to strip (defaults to TOOLS_WITH_LARGE_ARGS) */
+  toolsToStrip?: Set<string>;
+  /** Log prefix for debugging */
+  logPrefix?: string;
+}
+
+/**
+ * Strips large arguments from older tool calls to reduce state size.
+ * 
+ * The tool_calls structure is preserved (required by Anthropic API),
+ * but large args like jsxCode are replaced with placeholders for older calls.
+ * 
+ * This is CRITICAL for the builder agent which generates many components,
+ * each with 3-5KB of JSX code in the tool call arguments.
+ * 
+ * @param messages - Messages to process
+ * @param options - Stripping options
+ * @returns Messages with large args stripped from older tool calls
+ */
+export function stripLargeToolCallArgs(
+  messages: BaseMessage[],
+  options: StripLargeToolCallArgsOptions = {}
+): BaseMessage[] {
+  const {
+    keepCount = 3,
+    toolsToStrip = TOOLS_WITH_LARGE_ARGS,
+    logPrefix = "",
+  } = options;
+
+  const prefix = logPrefix ? `${logPrefix} ` : "";
+
+  // Count tool calls per tool name (tracking from newest to oldest)
+  // Map: toolName -> number of times we've seen it (counting from end)
+  const toolCallCounts = new Map<string, number>();
+  
+  // Process messages from newest to oldest, then reverse
+  const reversedMessages = [...messages].reverse();
+  const processedReversed: BaseMessage[] = [];
+  let strippedCount = 0;
+  let savedChars = 0;
+
+  for (const msg of reversedMessages) {
+    const msgType = getMessageType(msg);
+
+    if (msgType === "ai" || msgType === "AIMessage" || msgType === "AIMessageChunk") {
+      const aiMsg = msg as AIMessage;
+
+      if (aiMsg.tool_calls?.length) {
+        let needsModification = false;
+        const processedToolCalls = aiMsg.tool_calls.map((tc) => {
+          // Skip if not a tool we're stripping
+          if (!toolsToStrip.has(tc.name)) return tc;
+
+          // Increment count for this tool
+          const currentCount = toolCallCounts.get(tc.name) || 0;
+          toolCallCounts.set(tc.name, currentCount + 1);
+
+          // Keep full args for most recent N calls
+          if (currentCount < keepCount) return tc;
+
+          // Strip large args for older calls
+          const jsxCode = tc.args?.jsxCode;
+          if (typeof jsxCode === "string" && jsxCode.length > 100) {
+            needsModification = true;
+            strippedCount++;
+            savedChars += jsxCode.length - 30; // Approximate savings
+
+            return {
+              ...tc,
+              args: {
+                nodeId: tc.args?.nodeId,
+                baseType: tc.args?.baseType,
+                variant: tc.args?.variant,
+                jsxCode: `[JSX stripped - ${jsxCode.length} chars]`,
+                animationConfig: tc.args?.animationConfig,
+              },
+            };
+          }
+
+          return tc;
+        });
+
+        if (needsModification) {
+          // Also strip tool_use from content if present
+          let strippedContent = aiMsg.content;
+          if (Array.isArray(aiMsg.content)) {
+            strippedContent = (aiMsg.content as any[]).map((block) => {
+              if (
+                typeof block === "object" &&
+                block !== null &&
+                block.type === "tool_use" &&
+                toolsToStrip.has(block.name)
+              ) {
+                const count = toolCallCounts.get(block.name) || 0;
+                if (count > keepCount && block.input?.jsxCode) {
+                  const jsxLen = block.input.jsxCode.length;
+                  return {
+                    ...block,
+                    input: {
+                      ...block.input,
+                      jsxCode: `[JSX stripped - ${jsxLen} chars]`,
+                    },
+                  };
+                }
+              }
+              return block;
+            });
+          }
+
+          // Create new message with stripped tool calls
+          processedReversed.push(
+            new AIMessage({
+              content: strippedContent,
+              tool_calls: processedToolCalls,
+              id: aiMsg.id,
+              name: aiMsg.name,
+            })
+          );
+          continue;
+        }
+      }
+    }
+
+    processedReversed.push(msg);
+  }
+
+  // Reverse back to original order
+  const result = processedReversed.reverse();
+
+  if (strippedCount > 0) {
+    console.log(
+      `  ${prefix}[STRIP-ARGS] Stripped jsxCode from ${strippedCount} old generateCustomComponent calls, saved ~${Math.round(savedChars / 4)} tokens (${savedChars} chars)`
+    );
+  }
+
+  return result;
+}
+
+// ============================================================================
 // COMBINED CONTEXT PROCESSING
 // ============================================================================
 
@@ -1363,12 +1742,26 @@ export interface ProcessContextOptions {
   compressionKeepCount?: number;
   /** Max length for tool results before compression */
   compressionMaxLength?: number;
+  /** Whether to strip large tool call arguments (e.g., jsxCode from generateCustomComponent) */
+  enableToolArgStripping?: boolean;
+  /** Number of recent tool calls per tool type to keep with full args */
+  toolArgStripKeepCount?: number;
   /** Log prefix */
   logPrefix?: string;
   /** Original user request to preserve (from activeTask) - messages containing this will be kept */
   originalRequest?: string;
   /** Keywords that indicate task-critical messages to preserve during trimming */
   preserveKeywords?: string[];
+}
+
+/**
+ * Result of processContext - includes both processed messages and any generated summary.
+ */
+export interface ProcessContextResult {
+  /** Processed messages after all context management steps */
+  messages: BaseMessage[];
+  /** Generated conversation summary, or null if no summarization occurred */
+  summary: string | null;
 }
 
 /**
@@ -1389,14 +1782,17 @@ export interface ProcessContextOptions {
  * - Dangling tool call repair (AIMessage with tool_calls but no ToolMessage results)
  * - Orphan tool result filtering (ToolMessage without matching AIMessage tool_use)
  *
+ * Returns summary separately (not in messages) following LangChain's recommended pattern.
+ * Caller should store summary in state and inject as SystemMessage when calling LLM.
+ *
  * @param messages - Messages to process
  * @param options - Processing options
- * @returns Processed messages
+ * @returns Object with processed messages and optional summary text
  */
 export async function processContext(
   messages: BaseMessage[],
   options: ProcessContextOptions = {}
-): Promise<BaseMessage[]> {
+): Promise<ProcessContextResult> {
   const {
     maxTokens = TOKEN_LIMITS.orchestrator,
     model,
@@ -1410,12 +1806,15 @@ export async function processContext(
     enableToolCompression = false,
     compressionKeepCount = 2,
     compressionMaxLength = 1000,
+    enableToolArgStripping = false,
+    toolArgStripKeepCount = 3,
     logPrefix = "",
     originalRequest,
     preserveKeywords = [],
   } = options;
 
   let processed = messages;
+  let generatedSummary: string | null = null;
 
   // Step 1: Filter orphaned tool results (pre-trim)
   // Removes ToolMessages that have no matching AIMessage with tool_use
@@ -1425,6 +1824,16 @@ export async function processContext(
   // Creates synthetic ToolMessages for AIMessages with unresolved tool_calls
   // This follows LangGraph Deep Agents "Dangling Tool Call Repair" pattern
   processed = repairDanglingToolCalls(processed, logPrefix);
+
+  // Step 2.5: Strip large tool call arguments (if enabled)
+  // CRITICAL for builder agent: strips jsxCode from older generateCustomComponent calls
+  // This prevents message history from bloating with 3-5KB JSX per component
+  if (enableToolArgStripping) {
+    processed = stripLargeToolCallArgs(processed, {
+      keepCount: toolArgStripKeepCount,
+      logPrefix,
+    });
+  }
 
   // Step 3: Compress verbose tool results (if enabled)
   // This dramatically reduces token usage for tools like getAvailableTemplates,
@@ -1447,12 +1856,15 @@ export async function processContext(
   }
 
   // Step 5: Summarize (if enabled)
+  // Summary is returned separately (not as a message) - caller injects as SystemMessage
   if (enableSummarization) {
-    processed = await summarizeIfNeeded(processed, {
+    const summarizeResult = await summarizeIfNeeded(processed, {
       triggerTokens: summarizeTriggerTokens,
       keepMessages: summarizeKeepMessages,
       logPrefix,
     });
+    processed = summarizeResult.messages;
+    generatedSummary = summarizeResult.summary;
   }
 
   // Step 6: Trim to limit with task-critical message preservation
@@ -1475,6 +1887,9 @@ export async function processContext(
   // but keeps their corresponding AIMessage with tool_calls
   processed = repairDanglingToolCalls(processed, logPrefix);
 
-  return processed;
+  return {
+    messages: processed,
+    summary: generatedSummary,
+  };
 }
 

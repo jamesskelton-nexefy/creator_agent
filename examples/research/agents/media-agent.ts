@@ -20,6 +20,7 @@
 import { RunnableConfig } from "@langchain/core/runnables";
 import { AIMessage, SystemMessage, HumanMessage } from "@langchain/core/messages";
 import { ChatAnthropic } from "@langchain/anthropic";
+import { copilotkitCustomizeConfig } from "@copilotkit/sdk-js/langgraph";
 import type { OrchestratorState } from "../state/agent-state";
 import { generateTaskContext } from "../state/agent-state";
 
@@ -203,9 +204,15 @@ export async function mediaAgentNode(
 
   console.log("  Invoking media agent model...");
 
+  // Configure CopilotKit for proper tool emission (emits tool calls to frontend)
+  const customConfig = copilotkitCustomizeConfig(config, {
+    emitToolCalls: true,
+    emitMessages: true,
+  });
+
   let response = await modelWithTools.invoke(
     [systemMessage, ...recentMessages],
-    config
+    customConfig
   );
 
   console.log("  Media agent response received");
@@ -231,7 +238,7 @@ The user is waiting for media library information.`,
     console.log("  [RETRY] Re-invoking with nudge...");
     response = await modelWithTools.invoke(
       [systemMessage, ...recentMessages, nudgeMessage],
-      config
+      customConfig
     );
     
     aiResponse = response as AIMessage;

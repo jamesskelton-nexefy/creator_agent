@@ -45,6 +45,18 @@ const MAX_CREATED_NODES = 50;
  */
 const MAX_GENERATED_PREVIEWS = 20;
 
+/**
+ * Maximum number of generated components to keep in state.
+ * These store the full JSX code separately from messages.
+ */
+const MAX_GENERATED_COMPONENTS = 30;
+
+/**
+ * Maximum number of builder messages to keep.
+ * Prevents unbounded growth in builder's message channel.
+ */
+const MAX_BUILDER_MESSAGES = 50;
+
 // ============================================================================
 // TYPE DEFINITIONS - Structured outputs from each agent
 // ============================================================================
@@ -121,6 +133,25 @@ export interface ResearchBrief {
 }
 
 /**
+ * LXD Strategy for a planned course structure.
+ * Captures pedagogical decisions and objective mappings.
+ */
+export interface LXDStrategy {
+  /** Maps learning objectives to section/topic tempIds */
+  objectiveMapping: Record<string, string[]>;
+  /** Bloom's taxonomy levels targeted in this course */
+  bloomsLevels: ("remember" | "understand" | "apply" | "analyze" | "evaluate" | "create")[];
+  /** Assessment approach description */
+  assessmentApproach: string;
+  /** Engagement pattern description */
+  engagementPattern: string;
+  /** Adaptations made for target audience */
+  targetAudienceAdaptations: string;
+  /** Estimated course duration */
+  estimatedDuration: string;
+}
+
+/**
  * Planned structure from the Architect agent (PRE-creation phase).
  * This is the plan BEFORE nodes are created, allowing resumption if interrupted.
  * Separate from CourseStructure which represents the FINAL created structure.
@@ -142,6 +173,8 @@ export interface PlannedStructure {
   executionStatus: "planned" | "in_progress" | "completed" | "failed";
   /** Nodes that have been created (maps tempId to actual nodeId) */
   executedNodes: Record<string, string>;
+  /** LXD strategy and pedagogical metadata */
+  lxdStrategy?: LXDStrategy;
 }
 
 /**
@@ -160,6 +193,38 @@ export interface CourseStructure {
   /** Rationale for the structure */
   rationale: string;
 }
+
+/**
+ * Content block type for LXD-aware planning.
+ */
+export type ContentBlockType = 
+  | "title_block"
+  | "image_banner_block"
+  | "information_block"
+  | "text_block"
+  | "video_block"
+  | "three_images_block"
+  | "animation_block"
+  | "text_and_images_block"
+  | "question_block"
+  | "action_block";
+
+/**
+ * Bloom's taxonomy cognitive level.
+ */
+export type BloomsLevel = "remember" | "understand" | "apply" | "analyze" | "evaluate" | "create";
+
+/**
+ * Pedagogical intent for a content block.
+ */
+export type PedagogicalIntent = 
+  | "engage"      // Capture attention, motivate
+  | "inform"      // Deliver information
+  | "demonstrate" // Show how something works
+  | "practice"    // Active learning opportunity
+  | "assess"      // Check understanding
+  | "summarize"   // Recap key points
+  | "navigate";   // Guide to next steps
 
 /**
  * A planned node in the course structure.
@@ -183,6 +248,14 @@ export interface PlannedNode {
   objectives?: string[];
   /** Order among siblings */
   orderIndex: number;
+  /** Content block type for Level 6 nodes (LXD metadata) */
+  contentBlockType?: ContentBlockType;
+  /** Pedagogical intent for this block (LXD metadata) */
+  pedagogicalIntent?: PedagogicalIntent;
+  /** Bloom's taxonomy level targeted (LXD metadata) */
+  bloomsLevel?: BloomsLevel;
+  /** Learning objectives this block addresses (LXD metadata) */
+  linkedObjectives?: string[];
 }
 
 /**
@@ -345,6 +418,33 @@ export interface GeneratedPreview {
 }
 
 /**
+ * Generated component JSX storage - stored SEPARATELY from messages.
+ * This prevents massive JSX code from bloating the message history.
+ * 
+ * The jsxCode is stripped from tool_calls args in older messages,
+ * but preserved here for reference if needed.
+ */
+export interface GeneratedComponent {
+  /** The content node ID this component is for */
+  nodeId: string;
+  /** Base component type (TitleBlock, QuestionBlock, etc.) */
+  baseType: string;
+  /** Variant used (hero, card, standard, etc.) */
+  variant: string;
+  /** The full JSX code */
+  jsxCode: string;
+  /** Animation configuration */
+  animationConfig?: {
+    entrance?: string;
+    duration?: number;
+  };
+  /** When this was generated */
+  generatedAt: string;
+  /** Version (incremented on regeneration) */
+  version: number;
+}
+
+/**
  * Preview generation state from Builder Agent.
  * Tracks all generated previews and current preview mode.
  */
@@ -375,6 +475,71 @@ export interface ContentOutput {
   createdAt: string;
   /** Any issues or notes */
   notes?: string;
+}
+
+// ============================================================================
+// IMAGE GENERATOR STATE TYPES
+// ============================================================================
+
+/**
+ * Input node requiring image generation.
+ * Passed to the Image Generator tool/graph.
+ */
+export interface ImageNodeInput {
+  /** The node ID to generate images for */
+  nodeId: string;
+  /** Content block type (determines preset and style) */
+  contentBlockType: string;
+  /** Node title for context */
+  title: string;
+  /** Optional description for additional context */
+  description?: string;
+  /** Pedagogical intent for style adaptation */
+  pedagogicalIntent?: PedagogicalIntent;
+  /** Bloom's level for style adaptation */
+  bloomsLevel?: BloomsLevel;
+}
+
+/**
+ * Result of a single image generation.
+ * Returned from the Image Generator graph.
+ */
+export interface ImageGenerationResult {
+  /** The node ID this image was generated for */
+  nodeId: string;
+  /** Content block type */
+  contentBlockType: string;
+  /** File ID if successfully stored */
+  fileId: string;
+  /** The prompt used for generation */
+  prompt: string;
+  /** Preset used (banner, hero, content, etc.) */
+  preset: string;
+  /** Whether generation succeeded */
+  success: boolean;
+  /** Error message if failed */
+  error?: string;
+}
+
+/**
+ * State for the Image Generator graph.
+ * This is the internal state used by the compiled StateGraph.
+ */
+export interface ImageGeneratorState {
+  /** Input: nodes to process */
+  nodesToProcess: ImageNodeInput[];
+  /** Input: visual design context */
+  visualDesign: {
+    theme?: string;
+    tone?: string;
+    style?: string;
+  };
+  /** Messages for the LLM agent loop */
+  messages: BaseMessage[];
+  /** Output: results of image generation */
+  results: ImageGenerationResult[];
+  /** Output: summary for Writer */
+  summary: string;
 }
 
 /**
@@ -444,6 +609,33 @@ export interface ArchitectProgress {
   tempIdToNodeId: Record<string, string>;
   /** Count of nodes created in this session */
   nodesCreatedCount: number;
+  /** Last update timestamp */
+  lastUpdated: string;
+}
+
+/**
+ * Builder progress state - maintains context across orchestrator round-trips.
+ * This is critical for batch component generation sessions where context trimming
+ * would otherwise cause the builder to lose track of its preview generation work.
+ */
+export interface BuilderProgress {
+  /** Current workflow phase */
+  workflow: "idle" | "exploring" | "generating" | "complete";
+  /** Current scope being processed (parent node ID for batch operations) */
+  currentScope: string | null;
+  /** Node IDs that have been successfully generated */
+  generatedNodeIds: string[];
+  /** Node IDs pending generation in current batch */
+  pendingNodeIds: string[];
+  /** Summary of recent tool calls for context */
+  toolCallSummary: string[];
+  /** Cached node data from batch fetch (nodeId -> basic info) */
+  nodeDataCache?: Record<string, {
+    title: string;
+    contentBlockType?: string;
+    pedagogicalIntent?: string;
+    bloomsLevel?: string;
+  }>;
   /** Last update timestamp */
   lastUpdated: string;
 }
@@ -803,6 +995,39 @@ export const OrchestratorStateAnnotation = Annotation.Root({
     default: () => null,
   }),
 
+  /**
+   * Generated components storage - stores JSX code SEPARATELY from messages.
+   * This prevents the message history from bloating with large JSX strings.
+   * 
+   * When generateCustomComponent is called:
+   * 1. The component is stored here with full jsxCode
+   * 2. The jsxCode is stripped from older AIMessage tool_calls to save space
+   * 3. The component can still be accessed from this state field if needed
+   */
+  generatedComponents: Annotation<GeneratedComponent[]>({
+    reducer: (existing, update) => {
+      if (!update || update.length === 0) return existing || [];
+      const merged = [...(existing || [])];
+      for (const component of update) {
+        const existingIdx = merged.findIndex(c => c.nodeId === component.nodeId);
+        if (existingIdx >= 0) {
+          // Keep newer version
+          if (component.version > merged[existingIdx].version) {
+            merged[existingIdx] = component;
+          }
+        } else {
+          merged.push(component);
+        }
+      }
+      // Cap at MAX_GENERATED_COMPONENTS to prevent unbounded growth
+      if (merged.length > MAX_GENERATED_COMPONENTS) {
+        return merged.slice(-MAX_GENERATED_COMPONENTS);
+      }
+      return merged;
+    },
+    default: () => [],
+  }),
+
   /** Content outputs from the Writer (accumulates, capped at MAX_WRITTEN_CONTENT) */
   writtenContent: Annotation<ContentOutput[]>({
     reducer: (existing, update) => {
@@ -903,6 +1128,50 @@ export const OrchestratorStateAnnotation = Annotation.Root({
         toolCallSummary: mergedToolSummary,
         tempIdToNodeId: mergedTempIdMap,
         nodesCreatedCount: (existing.nodesCreatedCount || 0) + (update.nodesCreatedCount || 0),
+      };
+    },
+    default: () => null,
+  }),
+
+  /**
+   * Builder-specific message channel.
+   * Persists the builder's conversation independently from the main messages channel.
+   * This prevents context loss when the builder hands back to orchestrator and returns.
+   * Capped at MAX_BUILDER_MESSAGES to prevent unbounded growth.
+   */
+  builderMessages: Annotation<BaseMessage[]>({
+    reducer: (existing, update) => {
+      // Accumulate messages
+      const accumulated = [...(existing || []), ...(update || [])];
+      // Cap at MAX_BUILDER_MESSAGES to prevent state explosion
+      if (accumulated.length > MAX_BUILDER_MESSAGES) {
+        return accumulated.slice(-MAX_BUILDER_MESSAGES);
+      }
+      return accumulated;
+    },
+    default: () => [],
+  }),
+
+  /**
+   * Builder progress state - semantic context for builder continuity.
+   * Tracks what the builder has generated and is working on, surviving orchestrator round-trips.
+   * Critical for batch component generation where multiple invocations may be needed.
+   */
+  builderProgress: Annotation<BuilderProgress | null>({
+    reducer: (existing, update) => {
+      if (update === undefined) return existing;
+      if (update === null) return null;
+      if (!existing) return update;
+      // Merge: accumulate generated node IDs and tool summaries
+      const mergedGenerated = [...new Set([...(existing.generatedNodeIds || []), ...(update.generatedNodeIds || [])])];
+      const mergedToolSummary = [...(existing.toolCallSummary || []), ...(update.toolCallSummary || [])].slice(-20);
+      const mergedNodeCache = { ...(existing.nodeDataCache || {}), ...(update.nodeDataCache || {}) };
+      return {
+        ...existing,
+        ...update,
+        generatedNodeIds: mergedGenerated.slice(-100), // Cap at 100 generated nodes
+        toolCallSummary: mergedToolSummary,
+        nodeDataCache: mergedNodeCache,
       };
     },
     default: () => null,
@@ -1013,6 +1282,37 @@ export const OrchestratorStateAnnotation = Annotation.Root({
   researchIterationCount: Annotation<number>({
     reducer: (existing, update) => update ?? existing,
     default: () => 0,
+  }),
+
+  // ---- CopilotKit Frontend Tool Handling ----
+
+  /**
+   * Pending frontend actions that need to be emitted to CopilotKit.
+   * Used by copilotkit_handler node to track what needs to be sent.
+   * 
+   * When supervisor detects frontend tool calls, it stores them here
+   * and routes to copilotkit_handler. The handler emits them to CopilotKit
+   * and clears this field before routing back to supervisor.
+   */
+  pendingFrontendActions: Annotation<Array<{ name: string; id?: string; args: any }>>({
+    reducer: (_, update) => update ?? [],
+    default: () => [],
+  }),
+
+  // ---- Conversation Summary (LangChain recommended pattern) ----
+
+  /**
+   * Summary of earlier conversation history.
+   * Stored separately from messages and injected dynamically when calling the LLM.
+   * 
+   * This follows LangChain's recommended pattern:
+   * - Summary is stored in state, not as a message
+   * - Injected as a SystemMessage at the START of context when invoking LLM
+   * - Avoids "System messages are only permitted as the first passed message" errors
+   */
+  conversationSummary: Annotation<string | null>({
+    reducer: (existing, update) => update ?? existing,
+    default: () => null,
   }),
 });
 

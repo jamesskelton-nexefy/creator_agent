@@ -7,11 +7,6 @@
   },
   "env": ".env",
   "store": {
-    "index": {
-      "embed": "./lib/embeddings.ts:embeddings",
-      "dims": 1536,
-      "fields": ["$"]
-    },
     "ttl": {
       "refresh_on_read": true,
       "default_ttl": 10080
